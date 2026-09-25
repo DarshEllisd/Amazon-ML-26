@@ -1,0 +1,8 @@
+# Python 3.9 (tested on 3.9.0, Windows 11). All dependencies are MIT/BSD/Apache-2.0 licensed.
+polars==1.8.2
+pyarrow==21.0.0
+numpy==1.24.4
+scikit-learn==1.6.1
+rapidfuzz==3.13.0
+lightgbm==4.6.0
+pytest==8.4.2

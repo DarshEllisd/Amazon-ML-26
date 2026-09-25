@@ -1,0 +1,13 @@
+# challenge data and generated artefacts (large; never commit)
+6ab10eb3b23ba_student_resource/student_resource/dataset/
+__MACOSX/
+.DS_Store
+work/
+output/*.tsv
+*.parquet
+*.npy
+*.npz
+*.lgb
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

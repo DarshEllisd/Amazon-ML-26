@@ -1,0 +1,37 @@
+"""Paths and global constants. Override locations with BER_DATA_DIR / BER_WORK_DIR / BER_OUTPUT_DIR."""
+import os
+from pathlib import Path
+
+CODE_DIR = Path(__file__).resolve().parents[2]          # code/business_entity_resolution
+REPO_DIR = CODE_DIR.parents[1]
+
+DATA_DIR = Path(os.environ.get(
+    "BER_DATA_DIR",
+    REPO_DIR / "6ab10eb3b23ba_student_resource" / "student_resource" / "dataset"))
+WORK_DIR = Path(os.environ.get("BER_WORK_DIR", CODE_DIR / "work"))
+OUTPUT_DIR = Path(os.environ.get("BER_OUTPUT_DIR", REPO_DIR / "output"))
+
+SPLITS = ("train", "test")
+SOURCES = (1, 2, 3)
+
+SEED = 26
+
+
+def raw_path(split, src):
+    return DATA_DIR / split / f"{split}_source{src}.tsv"
+
+
+def gt_raw_path():
+    return DATA_DIR / "train" / "train_ground_truth.tsv"
+
+
+def records_path(split, src):
+    return WORK_DIR / "parquet" / f"{split}_s{src}.parquet"
+
+
+def gt_pairs_path():
+    return WORK_DIR / "parquet" / "train_gt_pairs.parquet"
+
+
+def gt_entities_path():
+    return WORK_DIR / "parquet" / "train_gt_entities.parquet"
