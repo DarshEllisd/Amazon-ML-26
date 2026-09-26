@@ -183,8 +183,10 @@ def _norm_chunk(args):
     return n, a
 
 
-def normalize_frame(df, processes=10, chunk=50_000):
+def normalize_frame(df, processes=None, chunk=50_000):
     """df has id, name, address, country; returns id, country + normalised columns."""
+    from . import config
+    processes = processes or max(1, config.N_JOBS - 2)
     names, addrs = df["name"].to_list(), df["address"].to_list()
     jobs = [(names[i:i + chunk], addrs[i:i + chunk]) for i in range(0, len(names), chunk)]
     core, legal, native, anorm, keys = [], [], [], [], []

@@ -23,3 +23,10 @@ def test_tune_tau_prefers_precision():
     gt = pl.DataFrame({"s1_id": [1], "m_src": [2], "m_id": [10]}, schema={"s1_id": pl.Int64, "m_src": pl.Int8, "m_id": pl.Int64})
     tau, curve = tune_tau(s, gt, pl.DataFrame({"s1_id": [1]}))
     assert 0.4 < tau <= 0.9 and max(f for _, f in curve) == 1.0
+
+
+def test_expected_f_select_drops_likely_singletons_and_keeps_confident():
+    from ber.assign import expected_f_select
+    s = scored([(1, 2, 10, 0.95), (1, 2, 11, 0.9), (1, 3, 12, 0.1), (2, 2, 20, 0.2)])
+    got = sorted(expected_f_select(s, extra=0.0).rows())
+    assert got == [(1, 2, 10), (1, 2, 11)]      # entity 2 is more likely a singleton

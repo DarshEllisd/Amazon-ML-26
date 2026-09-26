@@ -54,6 +54,7 @@ def _chunk_features(c, r1, rm):
     n_common = pl.col("nums").list.set_intersection(pl.col("nums_m")).list.len()
     return x.select(
         *KEY, "cos", "acos", "rank_name", "rank_addr", pl.col("b1").cast(pl.Int8),
+        *[c for c in ("ecos", "rank_emb") if c in x.columns],
         *feats.keys(),
         (both_legal & (pl.col("legal") == pl.col("legal_m"))).cast(pl.Int8).alias("legal_eq"),
         (both_legal & (pl.col("legal") != pl.col("legal_m"))).cast(pl.Int8).alias("legal_diff"),
@@ -74,6 +75,16 @@ def _chunk_features(c, r1, rm):
 
 def _sim_expr():
     return pl.col("n_tset") + pl.col("a_tset")
+
+
+def _emb_competition(f):
+    """Encoder-similarity competition features (only when candidates carry ecos)."""
+    if "ecos" not in f.columns:
+        return f
+    return f.with_columns(
+        (pl.col("ecos") - pl.col("ecos").max().over("m_src", "m_id")).alias("ecos_gap_m"),
+        pl.col("ecos").rank("min", descending=True).over("m_src", "m_id").cast(pl.Int16).alias("ecos_rank_m"),
+    )
 
 
 def _competition(f, s1_agg):
@@ -128,7 +139,11 @@ def build(cands, s1, m, log=print, sink=None):
     for b in range(n_buckets):
         c = cands.filter(bucket == b)
         f = _competition(_chunk_features(c, r1, rm), s1_agg)
-        f = f.filter(pl.col("sim_gap_m") >= PRUNE_SIM_GAP)
+        f = _emb_competition(f)
+        keep = pl.col("sim_gap_m") >= PRUNE_SIM_GAP
+        if "ecos_rank_m" in f.columns:     # never prune what the name encoder ranks top-2
+            keep = keep | (pl.col("ecos_rank_m") <= 2)
+        f = f.filter(keep)
         if sink is None:
             out.append(f)
         else:

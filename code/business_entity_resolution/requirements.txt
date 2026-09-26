@@ -8,6 +8,12 @@ rapidfuzz==3.13.0
 lightgbm==4.6.0
 anyascii==0.3.3          # ISC: ASCII fold / transliteration of native scripts
 pytest==8.4.2
+# multilingual name encoder (ber.embed): transformers Apache-2.0; base model intfloat/multilingual-e5-small (MIT)
+transformers==4.46.3
+tokenizers==0.20.3
+safetensors==0.4.5
+huggingface-hub==0.26.5
 # GPU top-k search (optional; falls back to scipy on CPU, much slower on test).
-# Install the CUDA build, e.g.: pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
-torch==2.5.1
+# Install the CUDA build: laptop (RTX 4050) torch==2.5.1 +cu121; workstation (RTX 5090 needs CUDA 12.8)
+#   pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1

@@ -18,6 +18,7 @@ and `predict` merges them. `--country C` runs a single country directly.
 Requires src/prepare_data.py, src/make_split.py and src/normalize_data.py.
 """
 import argparse
+import os
 import random
 import subprocess
 import sys
@@ -39,7 +40,8 @@ def rdir(run):
 
 
 def _read_norm(split, src):
-    lf = pl.scan_parquet(config.norm_path(split, src))
+    # `row` = position in the record parquet, used to look up name embeddings
+    lf = pl.scan_parquet(config.norm_path(split, src)).with_row_index("row")
     if COUNTRY:
         lf = lf.filter(pl.col("country") == COUNTRY)
     return lf.collect()
@@ -90,9 +92,12 @@ def load_universe(run):
         elif run == "fit":
             regions = _fit_regions()
             keep1 = sp1.filter((pl.col("fold") == "fit") & pl.col("region").is_in(regions))
+        elif run == "fitall":
+            regions = None
+            keep1 = sp1.filter(pl.col("fold") == "fit")
         else:
             raise ValueError(run)
-        fold = "fit" if run == "fit" else "val"
+        fold = "fit" if run.startswith("fit") else "val"
         s1 = s1.join(keep1.select("id"), on="id", how="semi")
         for i, s in enumerate((2, 3)):
             sp = pl.read_parquet(sd / f"s{s}.parquet").filter(pl.col("fold") == fold)
@@ -124,7 +129,8 @@ def stage_block(run):
     for old in cdir.glob("*.parquet"):
         old.unlink()
     _, s1r, mr, lexicon = generate(
-        s1, m, log=log, sink=lambda country, c: c.write_parquet(cdir / f"{country}.parquet"))
+        s1, m, log=log, sink=lambda country, c: c.write_parquet(cdir / f"{country}.parquet"),
+        split=split)
     cands = pl.scan_parquet(cdir / "*.parquet")
     s1r.select("s1_id", "region", "addr_nr").write_parquet(d / "s1_region.parquet")
     mr.select("m_src", "m_id", "region", "addr_nr").write_parquet(d / "m_region.parquet")
@@ -143,6 +149,8 @@ def stage_block(run):
         # recall by pass and for native-script records
         hit = gt.join(cands, on=["s1_id", "m_src", "m_id"], how="left").join(
             m.select("m_src", "m_id", "native"), on=["m_src", "m_id"])
+        if "rank_emb" in hit.columns:
+            log("  recall b5={:.4f}".format((hit["rank_emb"] < 99).mean()))
         log("  recall b1={:.4f} b2={:.4f} b6={:.4f} native={:.4f} latin={:.4f}".format(
             hit["b1"].fill_null(False).mean(), (hit["rank_name"] < 99).mean(), (hit["rank_addr"] < 99).mean(),
             hit.filter("native")["cos"].is_not_null().mean(),
@@ -159,11 +167,11 @@ def load_with_regions(run):
 
 def _load_model():
     import lightgbm as lgb
-    return lgb.Booster(model_file=str(MODEL_DIR / "m1.lgb"))
+    return lgb.Booster(model_file=str(MODEL_DIR / f"{MODEL_NAME}.lgb"))
 
 
 def _score(model, f):
-    p = model.predict(f.select(model.feature_name()).to_numpy().astype("float32"), num_threads=12)
+    p = model.predict(f.select(model.feature_name()).to_numpy().astype("float32"), num_threads=LGB_THREADS)
     return f.select("s1_id", "m_src", "m_id").with_columns(pl.Series("p", p.astype("float32")))
 
 
@@ -198,18 +206,20 @@ def stage_features(run):
 
 
 MODEL_DIR = config.WORK_DIR / "models"
-MAX_NEG = 8_000_000
-LGB_PARAMS = dict(objective="binary", learning_rate=0.08, num_leaves=127, min_data_in_leaf=100,
+LGB_THREADS = min(config.N_JOBS, 32)   # LightGBM slows down with too many threads
+MODEL_NAME = "m1"     # set by --model
+MAX_NEG = int(os.environ.get("BER_MAX_NEG", 8_000_000))
+LGB_PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=255, min_data_in_leaf=100,
                   feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
-                  verbose=-1, num_threads=12, seed=config.SEED)
-N_ROUNDS = 600
+                  verbose=-1, num_threads=LGB_THREADS, seed=config.SEED)
+N_ROUNDS = int(os.environ.get("BER_ROUNDS", 3000))
 
 
 def stage_train(run):
     import lightgbm as lgb
     from ber.features import feature_columns
 
-    assert run == "fit", "train on the fit universe"
+    assert run.startswith("fit"), "train on a fit universe"
     f = pl.read_parquet(rdir(run) / "features.parquet")
     pos, neg = f.filter(pl.col("label") == 1), f.filter(pl.col("label") == 0)
     if neg.height > MAX_NEG:
@@ -223,17 +233,95 @@ def stage_train(run):
     dtr = lgb.Dataset(tr.select(cols).to_numpy().astype("float32"), tr["label"].to_numpy(), feature_name=cols)
     des = lgb.Dataset(es.select(cols).to_numpy().astype("float32"), es["label"].to_numpy(), reference=dtr)
     model = lgb.train(LGB_PARAMS, dtr, N_ROUNDS, valid_sets=[des],
-                      callbacks=[lgb.early_stopping(50), lgb.log_evaluation(100)])
+                      callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)])
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    model.save_model(str(MODEL_DIR / "m1.lgb"))
+    model.save_model(str(MODEL_DIR / f"{MODEL_NAME}.lgb"))
     imp = sorted(zip(cols, model.feature_importance("gain")), key=lambda x: -x[1])
     log("top features: " + ", ".join(f"{c}={g:.0f}" for c, g in imp[:12]))
+    # out-of-fold stage-1 scores on this universe: the training input of stage 2
+    rounds = model.best_iteration or N_ROUNDS
+    full = pl.read_parquet(rdir(run) / "features.parquet")
+    half = lambda df: (df["s1_id"].hash(config.SEED + 1) % 2).to_numpy()
+    h_tr, h_full, oof = half(f), half(full), []
+    for k in (0, 1):
+        sel = h_tr != k
+        mk = lgb.train(LGB_PARAMS, lgb.Dataset(f.select(cols).to_numpy().astype("float32")[sel],
+                                               f["label"].to_numpy()[sel]), rounds)
+        part = full.filter(pl.Series(h_full == k))
+        oof.append(part.select("s1_id", "m_src", "m_id").with_columns(pl.Series(
+            "p", mk.predict(part.select(cols).to_numpy().astype("float32"),
+                            num_threads=LGB_THREADS).astype("float32"))))
+        log(f"  out-of-fold half {k} scored {part.height:,}")
+    pl.concat(oof).write_parquet(rdir(run) / "scored_oof.parquet")
+
+
+def _emb_lookup(split):
+    """(m_src array, row array) -> name embeddings, or None without embeddings."""
+    from ber.embed import emb_path, load_embeddings
+    import numpy as np
+    if os.environ.get("BER_NO_EMB") or not all(emb_path(split, s).exists() for s in (2, 3)):
+        return None
+    mm = {s: load_embeddings(split, s) for s in (2, 3)}
+
+    def get(src, rows):
+        out = np.empty((len(rows), mm[2].shape[1]), dtype=np.float16)
+        for s in (2, 3):
+            sel = np.flatnonzero(src == s)
+            order = np.argsort(rows[sel])
+            out[sel[order]] = mm[s][rows[sel][order]]
+        return out
+    return get
+
+
+def _group_frame(split, scored, m):
+    from ber import group
+    return group.build(scored, m, _emb_lookup(split), log=log)
+
+
+def stage_group(run):
+    """Train the stage-2 group model on out-of-fold stage-1 scores."""
+    import lightgbm as lgb
+    from ber.group import feature_columns
+
+    assert run.startswith("fit"), "train stage 2 on a fit universe"
+    split, s1, m = load_with_regions(run)
+    d = rdir(run)
+    scored = pl.read_parquet(d / "scored_oof.parquet")
+    g = _group_frame(split, scored, m)
+    gt = universe_gt(s1, m).with_columns(pl.lit(1, pl.Int8).alias("label"))
+    g = g.join(gt, on=["s1_id", "m_src", "m_id"], how="left").with_columns(pl.col("label").fill_null(0))
+    cols = feature_columns(g)
+    is_es = (pl.col("s1_id").hash(config.SEED) % 20) == 0
+    tr, es = g.filter(~is_es), g.filter(is_es)
+    log(f"stage 2: {tr.height:,} rows, {len(cols)} features: {cols}")
+    dtr = lgb.Dataset(tr.select(cols).to_numpy().astype("float32"), tr["label"].to_numpy(), feature_name=cols)
+    des = lgb.Dataset(es.select(cols).to_numpy().astype("float32"), es["label"].to_numpy(), reference=dtr)
+    params = dict(LGB_PARAMS, num_leaves=63)
+    model = lgb.train(params, dtr, N_ROUNDS, valid_sets=[des],
+                      callbacks=[lgb.early_stopping(100), lgb.log_evaluation(200)])
+    model.save_model(str(MODEL_DIR / f"{MODEL_NAME}_g.lgb"))
+    imp = sorted(zip(cols, model.feature_importance("gain")), key=lambda x: -x[1])
+    log("stage 2 top features: " + ", ".join(f"{c}={v:.0f}" for c, v in imp[:10]))
+
+
+def _apply_group(split, scored, m):
+    """Replace stage-1 p by the stage-2 probability when a stage-2 model exists."""
+    import lightgbm as lgb
+    path = MODEL_DIR / f"{MODEL_NAME}_g.lgb"
+    if not path.exists() or os.environ.get("BER_NO_GROUP"):
+        return scored
+    model = lgb.Booster(model_file=str(path))
+    g = _group_frame(split, scored, m)
+    p = model.predict(g.select(model.feature_name()).to_numpy().astype("float32"), num_threads=LGB_THREADS)
+    log(f"stage 2 applied to {g.height:,} pairs")
+    return g.select("s1_id", "m_src", "m_id", pl.col("p1"), pl.Series("p", p.astype("float32")))
 
 
 def stage_predict(run):
+    global COUNTRY
     import json
 
-    from ber.assign import matches, tune_tau
+    from ber.assign import apply_rule, tune_rule
     from ber.evaluate import report
     from ber.io import write_pair_table
 
@@ -243,34 +331,49 @@ def stage_predict(run):
         s1 = pl.read_parquet(config.norm_path("test", 1), columns=["id", "country"]).rename({"id": "s1_id"})
         parts = sorted((config.run_dir(run) / "country").glob("*/scored.parquet"))
         log("merging " + ", ".join(p.parent.name for p in parts))
-        scored = pl.concat([pl.read_parquet(p) for p in parts])
+        merged = []
+        for p in parts:
+            sc = pl.read_parquet(p)
+            if (MODEL_DIR / f"{MODEL_NAME}_g.lgb").exists():
+                COUNTRY = p.parent.name
+                _, _, mc = load_with_regions(run)
+                sc = _apply_group(split, sc, mc)
+                COUNTRY = None
+            merged.append(sc.select("s1_id", "m_src", "m_id", "p"))
+        scored = pl.concat(merged)
     else:
-        split, s1, m = load_universe(run)
+        split, s1, m = load_with_regions(run)
         scored = _score(_load_model(), pl.read_parquet(d / "features.parquet"))
         scored.write_parquet(d / "scored.parquet")
-    tau_path = MODEL_DIR / "m1_tau.json"
+        scored = _apply_group(split, scored, m)
+        scored.write_parquet(d / f"scored_final_{MODEL_NAME}.parquet")
+    tau_path = MODEL_DIR / f"{MODEL_NAME}_tau.json"
     if split == "train":
         gt = universe_gt(s1, m)
         ents = s1.select("s1_id", "country")
-        tau, curve = tune_tau(scored, gt, ents)
-        log("tau curve: " + " ".join(f"{t:.2f}:{v:.4f}" for t, v in curve))
+        rule, score, lines = tune_rule(scored, gt, ents)
+        for line in lines:
+            log(line)
+        log(f"decision rule {rule} -> {score:.4f}")
         if run == "val":
-            tau_path.write_text(json.dumps({"tau": tau}))
-        print(report(matches(scored, tau), gt, ents, by="country"))
+            tau_path.write_text(json.dumps(rule))
+        print(report(apply_rule(scored, rule), gt, ents, by="country"))
     else:
-        tau = json.loads(tau_path.read_text())["tau"]
-        pred = matches(scored, tau)
+        rule = json.loads(tau_path.read_text())
+        tau = rule["tau"]
+        pred = apply_rule(scored, rule)
         cand = scored.select("s1_id", "m_src", "m_id")
         assert pred.join(cand, on=["s1_id", "m_src", "m_id"], how="anti").height == 0
         write_pair_table(config.OUTPUT_DIR / "matching_results.tsv", s1["s1_id"], pred, "matched_entity_ids")
         write_pair_table(config.OUTPUT_DIR / "candidate_pairs.tsv", s1["s1_id"], cand, "candidate_entity_ids")
         per = pred.group_by("s1_id").len().join(s1.select("s1_id", "country"), on="s1_id", how="right")
-        log(f"tau={tau}; wrote {pred.height:,} matches, {cand.height:,} candidates")
+        log(f"rule={rule}; wrote {pred.height:,} matches, {cand.height:,} candidates")
         print(per.group_by("country").agg(pl.col("len").fill_null(0).mean().alias("matches_per_s1"),
                                           pl.col("len").is_null().mean().alias("empty_share")))
 
 
-STAGES = {"block": stage_block, "features": stage_features, "train": stage_train, "predict": stage_predict}
+STAGES = {"block": stage_block, "features": stage_features, "train": stage_train, "group": stage_group,
+          "predict": stage_predict}
 
 
 def _test_countries():
@@ -281,13 +384,16 @@ def _test_countries():
 def main():
     global COUNTRY
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run", required=True, choices=["mini", "val", "fit", "test"])
+    ap.add_argument("--run", required=True, choices=["mini", "val", "fit", "fitall", "test"])
     ap.add_argument("--stage", required=True, choices=list(STAGES) + ["all"])
     ap.add_argument("--country", help="test only: process a single country in this process")
+    ap.add_argument("--model", default="m1", help="model name under work/models (train/predict)")
     a = ap.parse_args()
-    COUNTRY = a.country
+    global MODEL_NAME
+    COUNTRY, MODEL_NAME = a.country, a.model
     if a.stage == "all":
-        stages = ["block", "features"] + (["train"] if a.run == "fit" else []) + (["predict"] if a.run != "fit" else [])
+        fit = a.run.startswith("fit")
+        stages = ["block", "features"] + (["train", "group"] if fit else []) + (["predict"] if not fit else [])
     else:
         stages = [a.stage]
     if a.run == "test" and COUNTRY is None:
@@ -296,7 +402,7 @@ def main():
             for s in per_country:
                 log(f"== test/{country}: {s} (subprocess)")
                 subprocess.run([sys.executable, "-X", "faulthandler", __file__, "--run", "test",
-                                "--stage", s, "--country", country], check=True)
+                                "--stage", s, "--country", country, "--model", MODEL_NAME], check=True)
         stages = [s for s in stages if s not in per_country]
     for s in stages:
         t = time.time()

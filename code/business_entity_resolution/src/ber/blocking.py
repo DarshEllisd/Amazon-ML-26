@@ -7,6 +7,8 @@ Passes (see PLAN.md §4):
       searches the country's pool of S1 entities without a (real) region.
   B6  the same search with word TF-IDF on the address minus its region parts
       (catches native-script and unrelated names at the same address).
+  B5  the same search with the fine-tuned multilingual name encoder
+      (ber.embed), when embeddings exist: cross-script names.
 
 Regions: S1 via geo.assign_region. S2/S3 via a lexicon learned from
 *pseudo-links* (B1 pairs whose names nearly agree), so no labels are needed
@@ -15,6 +17,8 @@ and it works for a country never seen in training (France).
 Frames: s1 has s1_id; m (S2+S3 stacked) has m_src, m_id; both carry the
 normalised columns from ber.normalize plus `country`.
 """
+import os
+
 import numpy as np
 import polars as pl
 from rapidfuzz import fuzz, process
@@ -34,6 +38,8 @@ TFIDF = dict(analyzer="char_wb", ngram_range=(3, 3), sublinear_tf=True, min_df=2
 TFIDF_ADDR = dict(analyzer="word", token_pattern=r"\S+", sublinear_tf=True, min_df=2,
                   max_df=0.05, dtype=np.float32)
 K_ADDR = 5
+K_EMB = 10
+MIN_ECOS = 0.3
 VEC_FIT_MAX = 3_000_000
 
 
@@ -113,7 +119,13 @@ def _fit_vec(texts, params):
 
 
 def _tfidf_pass(X, Q, s1_reg, m_reg, k_region, k_pool, log=None):
-    """Top-k search within region (+ country-wide for region-less, + pool) -> q, x, cos, rank."""
+    """Top-k TF-IDF search within region (+ country-wide for region-less, + pool)."""
+    return _region_pass(lambda qi, xi, k: topk(Q[qi], X[xi], k, min_score=MIN_COS),
+                        X.shape[0], s1_reg, m_reg, k_region, k_pool, log)
+
+
+def _region_pass(search, n_x, s1_reg, m_reg, k_region, k_pool, log=None):
+    """Run search(query_idx, index_idx, k) -> (r, c, score) per region -> q, x, rank."""
     out = []
 
     def add(qi, xi, k, what):
@@ -121,7 +133,7 @@ def _tfidf_pass(X, Q, s1_reg, m_reg, k_region, k_pool, log=None):
             return
         if log is not None:
             log(f"    {what}: {len(qi):,} queries x {len(xi):,} S1")
-        r, c, v = topk(Q[qi], X[xi], k, min_score=MIN_COS)
+        r, c, v = search(qi, xi, k)
         df = pl.DataFrame({"q": qi[r].astype(np.int64), "x": xi[c].astype(np.int64), "cos": v})
         out.append(df.with_columns(  # rank within this search, 0 = best
             pl.col("cos").rank("ordinal", descending=True).over("q").cast(pl.Int16).sub(1).alias("rank")))
@@ -129,7 +141,7 @@ def _tfidf_pass(X, Q, s1_reg, m_reg, k_region, k_pool, log=None):
     for reg in np.unique(s1_reg):
         if reg != "":
             add(np.flatnonzero(m_reg == reg), np.flatnonzero(s1_reg == reg), k_region, reg)
-    add(np.flatnonzero(m_reg == ""), np.arange(X.shape[0]), k_region, "no region")
+    add(np.flatnonzero(m_reg == ""), np.arange(n_x), k_region, "no region")
     add(np.flatnonzero(m_reg != ""), np.flatnonzero(s1_reg == ""), k_pool, "pool")
     if not out:
         return pl.DataFrame(schema={"q": pl.Int64, "x": pl.Int64, "rank": pl.Int16})
@@ -141,7 +153,26 @@ def _chunked_dot(A, B, xi, qi, chunk=2_000_000):
                            for i in range(0, len(xi), chunk)]) if len(xi) else np.empty(0, np.float32)
 
 
-def _country(s1c, mc, b1, log):
+def _gather_emb(split, df, src_col=None):
+    """Name embeddings for the rows of df (column `row` = row in the record parquet)."""
+    from .embed import emb_path, load_embeddings
+    srcs = (1,) if src_col is None else (2, 3)
+    if not all(emb_path(split, s).exists() for s in srcs):
+        return None
+    out = None
+    for s in srcs:
+        sel = (np.arange(df.height) if src_col is None
+               else np.flatnonzero(df[src_col].to_numpy() == s))
+        rows = df["row"].to_numpy()[sel]
+        order = np.argsort(rows)                     # sorted reads from the memmap
+        e = np.asarray(load_embeddings(split, s)[rows[order]])
+        if out is None:
+            out = np.empty((df.height, e.shape[1]), dtype=np.float16)
+        out[sel[order]] = e
+    return out
+
+
+def _country(s1c, mc, b1, log, split=None):
     s1_reg, m_reg = s1c["region"].to_numpy(), mc["region"].to_numpy()
     vn = _fit_vec(s1c["name_core"].to_list() + mc["name_core"].to_list(), TFIDF)
     Xn, Qn = vn.transform(s1c["name_core"].to_list()), vn.transform(mc["name_core"].to_list())
@@ -151,9 +182,19 @@ def _country(s1c, mc, b1, log):
     Xa, Qa = va.transform(s1c["addr_nr"].to_list()), va.transform(mc["addr_nr"].to_list())
     log(f"  {s1c['country'][0]}: address pass")
     b6 = _tfidf_pass(Xa, Qa, s1_reg, m_reg, K_ADDR, K_POOL, log)
+    E1 = Em = None
+    if split is not None and "row" in s1c.columns and not os.environ.get("BER_NO_EMB"):
+        E1, Em = _gather_emb(split, s1c), _gather_emb(split, mc, "m_src")
+    if E1 is not None and Em is not None:
+        from .embed import gpu_dense_topk
+        log(f"  {s1c['country'][0]}: embedding pass")
+        b5 = _region_pass(lambda qi, xi, k: gpu_dense_topk(Em[qi], E1[xi], k, min_score=MIN_ECOS),
+                          len(E1), s1_reg, m_reg, K_EMB, K_POOL, log)
+    else:
+        b5 = pl.DataFrame(schema={"q": pl.Int64, "x": pl.Int64, "rank": pl.Int16})
     log(f"  {s1c['country'][0]}: {len(np.unique(s1_reg))} regions, "
         f"{(m_reg == '').sum():,} region-less records, pool {(s1_reg == '').sum():,} S1; "
-        f"B2 {b2.height:,} B6 {b6.height:,}")
+        f"B2 {b2.height:,} B6 {b6.height:,} B5 {b5.height:,}")
 
     s1_idx = s1c.select("s1_id", pl.int_range(pl.len(), dtype=pl.Int64).alias("x"))
     m_idx = mc.select("m_src", "m_id", pl.int_range(pl.len(), dtype=pl.Int64).alias("q"))
@@ -161,18 +202,24 @@ def _country(s1c, mc, b1, log):
            .select("q", "x", pl.lit(True).alias("b1")))
     both = (b2.rename({"rank": "rank_name"})
             .join(b6.rename({"rank": "rank_addr"}), on=["q", "x"], how="full", coalesce=True)
+            .join(b5.rename({"rank": "rank_emb"}), on=["q", "x"], how="full", coalesce=True)
             .join(b1c, on=["q", "x"], how="full", coalesce=True))
     xi, qi = both["x"].to_numpy(), both["q"].to_numpy()
     both = both.with_columns(
         pl.Series("cos", _chunked_dot(Xn, Qn, xi, qi)),
         pl.Series("acos", _chunked_dot(Xa, Qa, xi, qi)),
         pl.col("b1").fill_null(False),
-        pl.col("rank_name").fill_null(99), pl.col("rank_addr").fill_null(99))
-    return (both.join(s1_idx, on="x").join(m_idx, on="q")
-            .select("s1_id", "m_src", "m_id", "cos", "acos", "rank_name", "rank_addr", "b1"))
+        pl.col("rank_name").fill_null(99), pl.col("rank_addr").fill_null(99),
+        pl.col("rank_emb").fill_null(99))
+    cols = ["s1_id", "m_src", "m_id", "cos", "acos", "rank_name", "rank_addr", "b1"]
+    if E1 is not None and Em is not None:
+        from .embed import rowwise_cos
+        both = both.with_columns(pl.Series("ecos", rowwise_cos(E1[xi], Em[qi])))
+        cols += ["ecos", "rank_emb"]
+    return both.join(s1_idx, on="x").join(m_idx, on="q").select(cols)
 
 
-def generate(s1, m, log=print, sink=None):
+def generate(s1, m, log=print, sink=None, split=None):
     """Return (candidates, s1 with region/addr_nr, m with region/addr_nr, lexicon).
 
     With `sink`, each country's candidates go to sink(country, frame) instead of
@@ -191,7 +238,7 @@ def generate(s1, m, log=print, sink=None):
         mc = m.filter(pl.col("country") == country)
         if mc.height == 0:
             continue
-        c = _country(s1c, mc, b1, log).with_columns(pl.col("m_src").cast(pl.Int8))
+        c = _country(s1c, mc, b1, log, split).with_columns(pl.col("m_src").cast(pl.Int8))
         log(f"  {country}: {c.height:,} candidates")
         if sink is None:
             cands.append(c)

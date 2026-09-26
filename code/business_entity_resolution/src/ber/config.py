@@ -43,3 +43,7 @@ def norm_path(split, src):
 
 def run_dir(run):
     return WORK_DIR / "runs" / run
+
+
+# worker threads/processes; defaults to every core (override with BER_JOBS)
+N_JOBS = int(os.environ.get("BER_JOBS", os.cpu_count() or 4))
