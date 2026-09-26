@@ -53,3 +53,24 @@ def write_id_lists(path, s1_ids, lists, header):
         for s1, lst in zip(s1_ids, lists):
             ids = ",".join(dict.fromkeys(f"S{s}-{i}" for s, i in lst))
             f.write(f"S1-{s1}\t{ids}\n")
+
+
+def write_pair_table(path, s1_ids, pairs, header):
+    """Vectorised submission writer for large pair sets.
+
+    s1_ids: Series of every int S1 id (one output row each, '' when no pairs);
+    pairs: frame with s1_id, m_src, m_id. Lists are deduplicated and sorted.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lists = (
+        pairs.select("s1_id", "m_src", "m_id").unique().sort("s1_id", "m_src", "m_id")
+        .select("s1_id", (pl.lit("S") + pl.col("m_src").cast(pl.Utf8) + pl.lit("-")
+                          + pl.col("m_id").cast(pl.Utf8)).alias("m"))
+        .group_by("s1_id", maintain_order=True).agg(pl.col("m").str.join(",").alias(header))
+    )
+    out = (
+        pl.DataFrame({"s1_id": s1_ids}).join(lists, on="s1_id", how="left")
+        .select((pl.lit("S1-") + pl.col("s1_id").cast(pl.Utf8)).alias("source1_entity_id"),
+                pl.col(header).fill_null(""))
+    )
+    out.write_csv(path, separator="\t", quote_style="never", line_terminator="\n")

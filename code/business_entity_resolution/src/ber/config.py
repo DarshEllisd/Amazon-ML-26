@@ -35,3 +35,11 @@ def gt_pairs_path():
 
 def gt_entities_path():
     return WORK_DIR / "parquet" / "train_gt_entities.parquet"
+
+
+def norm_path(split, src):
+    return WORK_DIR / "norm" / f"{split}_s{src}.parquet"
+
+
+def run_dir(run):
+    return WORK_DIR / "runs" / run

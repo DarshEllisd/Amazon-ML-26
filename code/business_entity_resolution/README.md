@@ -20,6 +20,15 @@ files, default `work/`) and `BER_OUTPUT_DIR` (default `../../output/`).
 |---|---|---|---|
 | 0. Parquet cache | `python src/prepare_data.py` | `work/parquet/` | ~25 s |
 | 1. Validation split | `python src/make_split.py` | `work/split/` | ~30 s |
+| 2. Normalise | `python src/normalize_data.py` | `work/norm/` | ~20 min |
+| 3. Train matcher | `python src/run_pipeline.py --run fit --stage all` | `work/models/m1.lgb` | ~35 min |
+| 4. Hold-out + threshold | `python src/run_pipeline.py --run val --stage all` | `work/models/m1_tau.json`, report | ~30 min |
+| 5. Test predictions | `python src/run_pipeline.py --run test --stage all` | `output/matching_results.tsv`, `output/candidate_pairs.tsv` | see below |
+
+Each `run_pipeline.py` run has the stages `block` → `features` → `train` (fit only) / `predict`,
+which can also be run one at a time with `--stage`. `--run mini` is a 58k-entity subset of val for
+fast iteration. Blocking uses the GPU through torch when CUDA is available (strongly recommended on
+test); otherwise it falls back to scipy.
 
 \*16 GB RAM / 12-core laptop.
 
@@ -31,7 +40,12 @@ Tests: `python -m pytest -q tests`
 - `src/ber/io.py`: TSV/parquet loading, submission writer (IDs kept as `(src, int)`)
 - `src/ber/evaluate.py`: exact macro F0.5 (with the singleton rule), blocking recall/oracle report
 - `src/ber/geo.py`: country-agnostic region detection (most frequent address component), region lexicon learned from linked records
-- `src/prepare_data.py`, `src/make_split.py`: pipeline entry points
+- `src/ber/normalize.py`: name/address normalisation (ASCII fold + transliteration, junk, leet, legal forms, street types, house-number keys)
+- `src/ber/blocking.py`: candidate generation: B1 address keys, B2 name char-3-gram TF-IDF, B6 address word TF-IDF, within (country, region); S2/S3 regions from an unsupervised pseudo-link lexicon
+- `src/ber/topk.py`: sparse top-k cosine search (GPU via torch, scipy fallback)
+- `src/ber/features.py`: pair + competition features (rapidfuzz), streamed per bucket of S2/S3 records
+- `src/ber/assign.py`: exclusive assignment (each S2/S3 record to at most its best S1) + threshold
+- `src/prepare_data.py`, `src/make_split.py`, `src/normalize_data.py`, `src/run_pipeline.py`: pipeline entry points
 
 ## Validation protocol
 

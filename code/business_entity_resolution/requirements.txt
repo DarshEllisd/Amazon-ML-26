@@ -1,8 +1,13 @@
-# Python 3.9 (tested on 3.9.0, Windows 11). All dependencies are MIT/BSD/Apache-2.0 licensed.
+# Python 3.9 (tested on 3.9.0, Windows 11). All dependencies are MIT/BSD/Apache-2.0/ISC licensed.
 polars==1.8.2
 pyarrow==21.0.0
 numpy==1.24.4
+scipy==1.13.1
 scikit-learn==1.6.1
 rapidfuzz==3.13.0
 lightgbm==4.6.0
+anyascii==0.3.3          # ISC: ASCII fold / transliteration of native scripts
 pytest==8.4.2
+# GPU top-k search (optional; falls back to scipy on CPU, much slower on test).
+# Install the CUDA build, e.g.: pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1
