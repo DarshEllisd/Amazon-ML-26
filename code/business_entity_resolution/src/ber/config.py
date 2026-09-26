@@ -47,3 +47,9 @@ def run_dir(run):
 
 # worker threads/processes; defaults to every core (override with BER_JOBS)
 N_JOBS = int(os.environ.get("BER_JOBS", os.cpu_count() or 4))
+
+
+def tag_suffix():
+    """BER_TAG separates artefact sets (e.g. 'all' = final models on every training pair)."""
+    tag = os.environ.get("BER_TAG", "")
+    return f"_{tag}" if tag else ""

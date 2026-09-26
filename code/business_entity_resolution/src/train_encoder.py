@@ -25,9 +25,11 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def training_pairs():
-    fit = pl.read_parquet(config.WORK_DIR / "split" / "s1.parquet").filter(pl.col("fold") == "fit")
-    s1 = load_records("train", 1, ["id", "name"]).join(fit.select("id"), on="id", how="semi")
+def training_pairs(all_train=False):
+    s1 = load_records("train", 1, ["id", "name"])
+    if not all_train:   # validation experiments: fit fold only
+        fit = pl.read_parquet(config.WORK_DIR / "split" / "s1.parquet").filter(pl.col("fold") == "fit")
+        s1 = s1.join(fit.select("id"), on="id", how="semi")
     gt = load_gt_pairs().join(s1.select(pl.col("id").alias("s1_id")), on="s1_id", how="semi")
     ms = pl.concat([
         load_records("train", s, ["id", "name"]).join(
@@ -66,9 +68,11 @@ def encode_all():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--encode", action="store_true", help="skip training")
+    ap.add_argument("--all-train", action="store_true",
+                    help="final model: train on every training pair (val regions included)")
     a = ap.parse_args()
     if not a.encode:
-        pa, pb = training_pairs()
+        pa, pb = training_pairs(a.all_train)
         embed.train(pa, pb, log=log)
     encode_all()
 

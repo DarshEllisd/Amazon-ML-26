@@ -37,7 +37,7 @@ def _p_features(scored):
     ).with_columns((pl.col("p") - pl.col("p1_other_m")).alias("p1_gap_m")).rename({"p": "p1"})
 
 
-def build(scored, m, emb_m=None, log=print):
+def build(scored, m, emb_m=None, log=print, extra=None):
     """scored: s1_id, m_src, m_id, p (stage-1, all candidates of the universe).
     m: records with m_src, m_id, name_core, addr_nr (+ row for embeddings).
     emb_m: optional function (m_src array, row array) -> float16 embeddings."""
@@ -74,6 +74,8 @@ def build(scored, m, emb_m=None, log=print):
         aggs += [pl.col("ge").max().alias("grp_ecos_max"), pl.col("ge").mean().alias("grp_ecos_mean")]
     g = g.group_by(KEY).agg(aggs) if g.height else g
     out = _p_features(scored).join(g, on=KEY, how="left").with_columns(pl.col("grp_n").fill_null(0))
+    if extra is not None:                     # e.g. cross-encoder logit `xe` (null outside its band)
+        out = out.join(extra, on=KEY, how="left")
     return out
 
 

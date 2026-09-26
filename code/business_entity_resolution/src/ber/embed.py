@@ -23,11 +23,11 @@ DIM = 384
 
 
 def emb_path(split, src):
-    return config.WORK_DIR / "emb" / f"{split}_s{src}.npy"
+    return config.WORK_DIR / f"emb{config.tag_suffix()}" / f"{split}_s{src}.npy"
 
 
 def model_dir():
-    return config.WORK_DIR / "models" / "name_encoder"
+    return config.WORK_DIR / "models" / f"name_encoder{config.tag_suffix()}"
 
 
 def _load(path_or_name, device):
@@ -105,12 +105,13 @@ def load_embeddings(split, src, mmap=True):
     return np.load(emb_path(split, src), mmap_mode="r" if mmap else None)
 
 
-def rowwise_cos(A, B, chunk=5_000_000):
-    """Elementwise dot of aligned float16 rows -> float32."""
-    out = np.empty(len(A), dtype=np.float32)
-    for i in range(0, len(A), chunk):
-        out[i:i + chunk] = np.einsum("ij,ij->i", A[i:i + chunk].astype(np.float32),
-                                     B[i:i + chunk].astype(np.float32))
+def rowwise_cos(A, B, ia, ib, chunk=2_000_000):
+    """dot(A[ia[k]], B[ib[k]]) for every k -> float32, gathering chunk by chunk
+    (gathering all rows first costs len(ia) * DIM * 2 bytes per side: ~46 GB at 60M pairs)."""
+    out = np.empty(len(ia), dtype=np.float32)
+    for i in range(0, len(ia), chunk):
+        out[i:i + chunk] = np.einsum("ij,ij->i", A[ia[i:i + chunk]].astype(np.float32),
+                                     B[ib[i:i + chunk]].astype(np.float32))
     return out
 
 

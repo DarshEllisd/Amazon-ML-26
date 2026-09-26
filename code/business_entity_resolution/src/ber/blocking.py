@@ -214,7 +214,7 @@ def _country(s1c, mc, b1, log, split=None):
     cols = ["s1_id", "m_src", "m_id", "cos", "acos", "rank_name", "rank_addr", "b1"]
     if E1 is not None and Em is not None:
         from .embed import rowwise_cos
-        both = both.with_columns(pl.Series("ecos", rowwise_cos(E1[xi], Em[qi])))
+        both = both.with_columns(pl.Series("ecos", rowwise_cos(E1, Em, xi, qi)))
         cols += ["ecos", "rank_emb"]
     return both.join(s1_idx, on="x").join(m_idx, on="q").select(cols)
 

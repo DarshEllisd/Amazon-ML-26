@@ -33,6 +33,11 @@ FIT_FRACTION = 0.10
 COUNTRY = None  # set by --country: restrict the universe to one country
 
 
+def _is_train_run(run):
+    """Universes that models are trained on."""
+    return run.startswith("fit") or run == "all"
+
+
 def rdir(run):
     """Directory of this run's artefacts (per country when --country is set)."""
     d = config.run_dir(run)
@@ -80,7 +85,7 @@ def load_universe(run):
     split = "test" if run == "test" else "train"
     s1 = _read_norm(split, 1)
     ms = [_read_norm(split, s).with_columns(pl.lit(s, pl.Int8).alias("m_src")) for s in (2, 3)]
-    if run != "test":
+    if run not in ("test", "all"):   # "all" = every training record (final model)
         sd = config.WORK_DIR / "split"
         sp1 = pl.read_parquet(sd / "s1.parquet")
         if run == "val":
@@ -160,8 +165,13 @@ def stage_block(run):
 def load_with_regions(run):
     split, s1, m = load_universe(run)
     d = rdir(run)
-    s1 = s1.join(pl.read_parquet(d / "s1_region.parquet"), on="s1_id")
-    m = m.join(pl.read_parquet(d / "m_region.parquet"), on=["m_src", "m_id"])
+    if (d / "s1_region.parquet").exists():
+        r1, rm = pl.read_parquet(d / "s1_region.parquet"), pl.read_parquet(d / "m_region.parquet")
+    else:   # blocked one country per subprocess (fitall): merge the per-country files
+        r1 = pl.concat([pl.read_parquet(p) for p in sorted(d.glob("country/*/s1_region.parquet"))])
+        rm = pl.concat([pl.read_parquet(p) for p in sorted(d.glob("country/*/m_region.parquet"))])
+    s1 = s1.join(r1, on="s1_id")
+    m = m.join(rm, on=["m_src", "m_id"])
     return split, s1, m
 
 
@@ -172,7 +182,8 @@ def _load_model():
 
 def _score(model, f):
     p = model.predict(f.select(model.feature_name()).to_numpy().astype("float32"), num_threads=LGB_THREADS)
-    return f.select("s1_id", "m_src", "m_id").with_columns(pl.Series("p", p.astype("float32")))
+    keep = ["s1_id", "m_src", "m_id"] + [c for c in ("ecos_rank_m",) if c in f.columns]
+    return f.select(keep).with_columns(pl.Series("p", p.astype("float32")))
 
 
 def stage_features(run):
@@ -183,7 +194,7 @@ def stage_features(run):
 
     split, s1, m = load_with_regions(run)
     d = rdir(run)
-    files = sorted((d / "candidates").glob("*.parquet"))
+    files = sorted((d / "candidates").glob("*.parquet")) + sorted(d.glob("country/*/candidates/*.parquet"))
     if split == "test":
         model, scored = _load_model(), []
         for fp in files:
@@ -208,6 +219,7 @@ def stage_features(run):
 MODEL_DIR = config.WORK_DIR / "models"
 LGB_THREADS = min(config.N_JOBS, 32)   # LightGBM slows down with too many threads
 MODEL_NAME = "m1"     # set by --model
+RERANK_MAX = int(os.environ.get("BER_RERANK_MAX", 3_000_000))
 MAX_NEG = int(os.environ.get("BER_MAX_NEG", 8_000_000))
 LGB_PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=255, min_data_in_leaf=100,
                   feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
@@ -219,7 +231,7 @@ def stage_train(run):
     import lightgbm as lgb
     from ber.features import feature_columns
 
-    assert run.startswith("fit"), "train on a fit universe"
+    assert _is_train_run(run), "train on a fit universe"
     f = pl.read_parquet(rdir(run) / "features.parquet")
     pos, neg = f.filter(pl.col("label") == 1), f.filter(pl.col("label") == 0)
     if neg.height > MAX_NEG:
@@ -248,7 +260,8 @@ def stage_train(run):
         mk = lgb.train(LGB_PARAMS, lgb.Dataset(f.select(cols).to_numpy().astype("float32")[sel],
                                                f["label"].to_numpy()[sel]), rounds)
         part = full.filter(pl.Series(h_full == k))
-        oof.append(part.select("s1_id", "m_src", "m_id").with_columns(pl.Series(
+        oof.append(part.select("s1_id", "m_src", "m_id", *[c for c in ("ecos_rank_m",) if c in part.columns])
+                   .with_columns(pl.Series(
             "p", mk.predict(part.select(cols).to_numpy().astype("float32"),
                             num_threads=LGB_THREADS).astype("float32"))))
         log(f"  out-of-fold half {k} scored {part.height:,}")
@@ -273,9 +286,56 @@ def _emb_lookup(split):
     return get
 
 
-def _group_frame(split, scored, m):
+def _pair_texts(split, pairs):
+    """'name | address' raw texts of both sides of each pair (native scripts kept)."""
+    from ber.io import load_records
+    rec1 = load_records(split, 1, ["id", "name", "address"]).join(
+        pairs.select(pl.col("s1_id").alias("id")).unique(), on="id", how="semi")
+    recm = pl.concat([load_records(split, s, ["id", "name", "address"])
+                      .with_columns(pl.lit(s, pl.Int8).alias("m_src")) for s in (2, 3)]).join(
+        pairs.select("m_src", pl.col("m_id").alias("id")).unique(), on=["m_src", "id"], how="semi")
+    txt = pl.col("name") + pl.lit(" | ") + pl.col("address")
+    x = (pairs.join(rec1.select(pl.col("id").alias("s1_id"), txt.alias("a")), on="s1_id", how="left")
+         .join(recm.select("m_src", pl.col("id").alias("m_id"), txt.alias("b")), on=["m_src", "m_id"],
+               how="left"))
+    return x["a"].fill_null("").to_list(), x["b"].fill_null("").to_list()
+
+
+def _rerank_frame(split, scored):
+    """Cross-encoder logits `xe` for the uncertain band of stage-1 scores (or None)."""
+    from ber import rerank
+    if os.environ.get("BER_NO_RERANK") or not (rerank.model_dir() / "head.pt").exists():
+        return None
+    band = scored.filter(rerank.in_band(pl, scored.columns)).select("s1_id", "m_src", "m_id")
+    log(f"  reranking {band.height:,} band pairs of {scored.height:,}")
+    a, b = _pair_texts(split, band)
+    return band.with_columns(pl.Series("xe", rerank.score(a, b, log=log)))
+
+
+def stage_rerank(run):
+    """Train the cross-encoder on one half of the fit entities, score the other half."""
+    from ber import rerank
+    assert _is_train_run(run), "train the reranker on a fit universe"
+    split = "train"
+    d = rdir(run)
+    oof = pl.read_parquet(d / "scored_oof.parquet")
+    band = oof.filter(rerank.in_band(pl, oof.columns))
+    gt = load_gt_pairs().with_columns(pl.lit(1.0).alias("y"))
+    band = band.join(gt, on=["s1_id", "m_src", "m_id"], how="left").with_columns(pl.col("y").fill_null(0.0))
+    tr = band.filter(rerank.half_expr(pl) == rerank.RERANK_HALF)
+    if tr.height > RERANK_MAX:
+        tr = tr.sample(RERANK_MAX, seed=config.SEED)
+    log(f"rerank: band {band.height:,} pairs; training on {tr.height:,} ({tr['y'].mean():.1%} positive)")
+    a, b = _pair_texts(split, tr)
+    rerank.train(a, b, tr["y"].to_list(), log=log)
+    other = oof.filter(rerank.half_expr(pl) != rerank.RERANK_HALF)
+    xe = _rerank_frame(split, other)
+    xe.write_parquet(d / "rerank_oof.parquet")
+
+
+def _group_frame(split, scored, m, extra=None):
     from ber import group
-    return group.build(scored, m, _emb_lookup(split), log=log)
+    return group.build(scored, m, _emb_lookup(split), log=log, extra=extra)
 
 
 def stage_group(run):
@@ -283,11 +343,17 @@ def stage_group(run):
     import lightgbm as lgb
     from ber.group import feature_columns
 
-    assert run.startswith("fit"), "train stage 2 on a fit universe"
+    assert _is_train_run(run), "train stage 2 on a fit universe"
     split, s1, m = load_with_regions(run)
     d = rdir(run)
     scored = pl.read_parquet(d / "scored_oof.parquet")
-    g = _group_frame(split, scored, m)
+    extra = None
+    if (d / "rerank_oof.parquet").exists() and not os.environ.get("BER_NO_RERANK"):
+        from ber import rerank
+        extra = pl.read_parquet(d / "rerank_oof.parquet")
+    g = _group_frame(split, scored, m, extra)
+    if extra is not None:     # rows whose entity trained the reranker would carry in-sample xe
+        g = g.filter(rerank.half_expr(pl) != rerank.RERANK_HALF)
     gt = universe_gt(s1, m).with_columns(pl.lit(1, pl.Int8).alias("label"))
     g = g.join(gt, on=["s1_id", "m_src", "m_id"], how="left").with_columns(pl.col("label").fill_null(0))
     cols = feature_columns(g)
@@ -311,7 +377,10 @@ def _apply_group(split, scored, m):
     if not path.exists() or os.environ.get("BER_NO_GROUP"):
         return scored
     model = lgb.Booster(model_file=str(path))
-    g = _group_frame(split, scored, m)
+    extra = _rerank_frame(split, scored) if "xe" in model.feature_name() else None
+    g = _group_frame(split, scored, m, extra)
+    if "xe" in model.feature_name() and "xe" not in g.columns:
+        g = g.with_columns(pl.lit(None, pl.Float32).alias("xe"))
     p = model.predict(g.select(model.feature_name()).to_numpy().astype("float32"), num_threads=LGB_THREADS)
     log(f"stage 2 applied to {g.height:,} pairs")
     return g.select("s1_id", "m_src", "m_id", pl.col("p1"), pl.Series("p", p.astype("float32")))
@@ -372,19 +441,19 @@ def stage_predict(run):
                                           pl.col("len").is_null().mean().alias("empty_share")))
 
 
-STAGES = {"block": stage_block, "features": stage_features, "train": stage_train, "group": stage_group,
-          "predict": stage_predict}
+STAGES = {"block": stage_block, "features": stage_features, "train": stage_train, "rerank": stage_rerank,
+          "group": stage_group, "predict": stage_predict}
 
 
-def _test_countries():
-    return sorted(pl.scan_parquet(config.norm_path("test", 1)).select(pl.col("country").unique())
+def _countries(split):
+    return sorted(pl.scan_parquet(config.norm_path(split, 1)).select(pl.col("country").unique())
                   .collect()["country"].to_list())
 
 
 def main():
     global COUNTRY
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run", required=True, choices=["mini", "val", "fit", "fitall", "test"])
+    ap.add_argument("--run", required=True, choices=["mini", "val", "fit", "fitall", "all", "test"])
     ap.add_argument("--stage", required=True, choices=list(STAGES) + ["all"])
     ap.add_argument("--country", help="test only: process a single country in this process")
     ap.add_argument("--model", default="m1", help="model name under work/models (train/predict)")
@@ -392,16 +461,17 @@ def main():
     global MODEL_NAME
     COUNTRY, MODEL_NAME = a.country, a.model
     if a.stage == "all":
-        fit = a.run.startswith("fit")
-        stages = ["block", "features"] + (["train", "group"] if fit else []) + (["predict"] if not fit else [])
+        fit = _is_train_run(a.run)
+        stages = ["block", "features"] + (["train", "rerank", "group"] if fit else []) + (["predict"] if not fit else [])
     else:
         stages = [a.stage]
-    if a.run == "test" and COUNTRY is None:
-        per_country = [s for s in stages if s in ("block", "features")]
-        for country in _test_countries():
+    if a.run in ("test", "fitall", "all") and COUNTRY is None:
+        # one country per subprocess bounds memory; fitall only needs it for blocking
+        per_country = [s for s in stages if s in (("block", "features") if a.run == "test" else ("block",))]
+        for country in _countries("test" if a.run == "test" else "train"):
             for s in per_country:
-                log(f"== test/{country}: {s} (subprocess)")
-                subprocess.run([sys.executable, "-X", "faulthandler", __file__, "--run", "test",
+                log(f"== {a.run}/{country}: {s} (subprocess)")
+                subprocess.run([sys.executable, "-X", "faulthandler", __file__, "--run", a.run,
                                 "--stage", s, "--country", country, "--model", MODEL_NAME], check=True)
         stages = [s for s in stages if s not in per_country]
     for s in stages:
