@@ -11,10 +11,16 @@ work/split: `val` = held-out regions, `mini` = its smallest region per country,
 universe keeps all S1/S2/S3 records of its regions, distractors included.
 `predict` needs a model trained by `--run fit --stage train`.
 
+Test runs one country per subprocess (block + features), so each process
+holds only that country's records; results go to work/runs/test/country/<C>/
+and `predict` merges them. `--country C` runs a single country directly.
+
 Requires src/prepare_data.py, src/make_split.py and src/normalize_data.py.
 """
 import argparse
 import random
+import subprocess
+import sys
 import time
 
 import polars as pl
@@ -23,6 +29,20 @@ from ber import config
 from ber.io import load_gt_pairs
 
 FIT_FRACTION = 0.10
+COUNTRY = None  # set by --country: restrict the universe to one country
+
+
+def rdir(run):
+    """Directory of this run's artefacts (per country when --country is set)."""
+    d = config.run_dir(run)
+    return d / "country" / COUNTRY if COUNTRY else d
+
+
+def _read_norm(split, src):
+    lf = pl.scan_parquet(config.norm_path(split, src))
+    if COUNTRY:
+        lf = lf.filter(pl.col("country") == COUNTRY)
+    return lf.collect()
 
 
 def log(msg):
@@ -56,9 +76,8 @@ def _fit_regions():
 def load_universe(run):
     """Return (split, s1, m) with normalised columns; ids renamed s1_id / (m_src, m_id)."""
     split = "test" if run == "test" else "train"
-    s1 = pl.read_parquet(config.norm_path(split, 1))
-    ms = [pl.read_parquet(config.norm_path(split, s)).with_columns(pl.lit(s, pl.Int8).alias("m_src"))
-          for s in (2, 3)]
+    s1 = _read_norm(split, 1)
+    ms = [_read_norm(split, s).with_columns(pl.lit(s, pl.Int8).alias("m_src")) for s in (2, 3)]
     if run != "test":
         sd = config.WORK_DIR / "split"
         sp1 = pl.read_parquet(sd / "s1.parquet")
@@ -99,7 +118,7 @@ def stage_block(run):
 
     split, s1, m = load_universe(run)
     log(f"{run}: {s1.height:,} S1, {m.height:,} S2/S3")
-    d = config.run_dir(run)
+    d = rdir(run)
     cdir = d / "candidates"
     cdir.mkdir(parents=True, exist_ok=True)
     for old in cdir.glob("*.parquet"):
@@ -132,7 +151,7 @@ def stage_block(run):
 
 def load_with_regions(run):
     split, s1, m = load_universe(run)
-    d = config.run_dir(run)
+    d = rdir(run)
     s1 = s1.join(pl.read_parquet(d / "s1_region.parquet"), on="s1_id")
     m = m.join(pl.read_parquet(d / "m_region.parquet"), on=["m_src", "m_id"])
     return split, s1, m
@@ -155,7 +174,7 @@ def stage_features(run):
     from ber.features import build
 
     split, s1, m = load_with_regions(run)
-    d = config.run_dir(run)
+    d = rdir(run)
     files = sorted((d / "candidates").glob("*.parquet"))
     if split == "test":
         model, scored = _load_model(), []
@@ -191,7 +210,7 @@ def stage_train(run):
     from ber.features import feature_columns
 
     assert run == "fit", "train on the fit universe"
-    f = pl.read_parquet(config.run_dir(run) / "features.parquet")
+    f = pl.read_parquet(rdir(run) / "features.parquet")
     pos, neg = f.filter(pl.col("label") == 1), f.filter(pl.col("label") == 0)
     if neg.height > MAX_NEG:
         neg = neg.sample(MAX_NEG, seed=config.SEED)
@@ -218,11 +237,15 @@ def stage_predict(run):
     from ber.evaluate import report
     from ber.io import write_pair_table
 
-    split, s1, m = load_universe(run)
-    d = config.run_dir(run)
-    if split == "test":
-        scored = pl.read_parquet(d / "scored.parquet")
+    d = rdir(run)
+    if run == "test":
+        split = "test"
+        s1 = pl.read_parquet(config.norm_path("test", 1), columns=["id", "country"]).rename({"id": "s1_id"})
+        parts = sorted((config.run_dir(run) / "country").glob("*/scored.parquet"))
+        log("merging " + ", ".join(p.parent.name for p in parts))
+        scored = pl.concat([pl.read_parquet(p) for p in parts])
     else:
+        split, s1, m = load_universe(run)
         scored = _score(_load_model(), pl.read_parquet(d / "features.parquet"))
         scored.write_parquet(d / "scored.parquet")
     tau_path = MODEL_DIR / "m1_tau.json"
@@ -250,15 +273,31 @@ def stage_predict(run):
 STAGES = {"block": stage_block, "features": stage_features, "train": stage_train, "predict": stage_predict}
 
 
+def _test_countries():
+    return sorted(pl.scan_parquet(config.norm_path("test", 1)).select(pl.col("country").unique())
+                  .collect()["country"].to_list())
+
+
 def main():
+    global COUNTRY
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True, choices=["mini", "val", "fit", "test"])
     ap.add_argument("--stage", required=True, choices=list(STAGES) + ["all"])
+    ap.add_argument("--country", help="test only: process a single country in this process")
     a = ap.parse_args()
+    COUNTRY = a.country
     if a.stage == "all":
         stages = ["block", "features"] + (["train"] if a.run == "fit" else []) + (["predict"] if a.run != "fit" else [])
     else:
         stages = [a.stage]
+    if a.run == "test" and COUNTRY is None:
+        per_country = [s for s in stages if s in ("block", "features")]
+        for country in _test_countries():
+            for s in per_country:
+                log(f"== test/{country}: {s} (subprocess)")
+                subprocess.run([sys.executable, "-X", "faulthandler", __file__, "--run", "test",
+                                "--stage", s, "--country", country], check=True)
+        stages = [s for s in stages if s not in per_country]
     for s in stages:
         t = time.time()
         log(f"== {a.run}: {s}")
