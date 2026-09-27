@@ -52,9 +52,11 @@ bash src/reproduce.sh --validate   # also the held-out validation experiment (+~
 | 4. Train all models | `BER_TAG=all python src/run_pipeline.py --run all --stage all --model final` | `work/models/final*.lgb`, `work/models/reranker_all/` |
 | 5. Predict test | `BER_TAG=all python src/run_pipeline.py --run test --stage all --model final` | `output/*.tsv` |
 
-**Reproducibility:** a full rerun gives the same candidate set byte for byte. It can differ from the submitted
-matches in a handful of borderline pairs, because of GPU floating-point differences in reranker scoring (batch
-composition changes with the number of GPUs). Regenerating on our workstation changed 1 of 1,732,544 rows.
+**Reproducibility:** the submitted `output/` files were produced by this code: `run_pipeline.py --run test`
+with the models described here. A full rerun gives the same candidate set byte for byte. On different GPUs it can
+differ in a handful of borderline matches, because of floating-point differences in reranker scoring (batch
+composition changes with the number of GPUs). Moving France's reranker from 1 to 2 GPUs changed 1 of
+1,732,544 rows.
 
 `run_pipeline.py` runs the stages `block → features → train → rerank → group` on a training
 universe, and `block → features → predict` on `val`/`test`. Any single stage can be re-run with
