@@ -29,9 +29,9 @@ MAX_LEN = 128
 BAND = (0.001, 0.99) if os.environ.get("BER_BAND", "wide") == "wide" else (0.01, 0.99)
 RERANK_HALF = 0           # fit entities with hash(s1_id) % 2 == RERANK_HALF train the reranker
 KIND = os.environ.get("BER_RERANK_MODEL", "bge-m3")   # val: bge-m3 0.9930 vs e5-small 0.9877
-MODELS = {  # name -> (checkpoint, train batch, learning rate)
-    "e5-small": (BASE_MODEL, 256, 5e-5),
-    "bge-m3": ("BAAI/bge-reranker-v2-m3", 128, 2e-5),
+MODELS = {  # name -> (checkpoint, train batch, learning rate, micro-batches per step)
+    "e5-small": (BASE_MODEL, 256, 5e-5, 1),
+    "bge-m3": ("BAAI/bge-reranker-v2-m3", 128, 2e-5, 2),   # 2 x 64: fits 32 GB with headroom
 }
 RERANK_ALL = os.environ.get("BER_RERANK_ALL", "1") == "1"
 
@@ -85,7 +85,7 @@ def _tok(path=None):
 
 
 def train(a, b, y, epochs=1, batch_size=None, lr=None, device="cuda", log=print):
-    ckpt, bs, base_lr = MODELS[KIND]
+    ckpt, bs, base_lr, accum = MODELS[KIND]
     batch_size, lr = batch_size or bs, lr or base_lr
     tok = _tok()
     model = CrossEncoder(ckpt).to(device).train()
@@ -100,15 +100,16 @@ def train(a, b, y, epochs=1, batch_size=None, lr=None, device="cuda", log=print)
     for _ in range(epochs):
         order = rng.permutation(n)
         for i in range(0, n - batch_size + 1, batch_size):
-            idx = order[i:i + batch_size]
-            batch = tok([a[j] for j in idx], [b[j] for j in idx], padding=True, truncation=True,
-                        max_length=MAX_LEN, return_tensors="pt").to(device)
-            target = torch.from_numpy(y[idx]).to(device)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                logit = model(batch)
-            loss = F.binary_cross_entropy_with_logits(logit.float(), target)
+            idx_all = order[i:i + batch_size]
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            for idx in np.array_split(idx_all, accum):   # same update as one full batch
+                batch = tok([a[j] for j in idx], [b[j] for j in idx], padding=True, truncation=True,
+                            max_length=MAX_LEN, return_tensors="pt").to(device)
+                target = torch.from_numpy(y[idx]).to(device)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    logit = model(batch)
+                loss = F.binary_cross_entropy_with_logits(logit.float(), target) * (len(idx) / len(idx_all))
+                loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             sched.step()

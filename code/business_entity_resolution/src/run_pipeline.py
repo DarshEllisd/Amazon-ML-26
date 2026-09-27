@@ -350,9 +350,10 @@ def stage_rerank(run):
     gt = load_gt_pairs().with_columns(pl.lit(1.0).alias("y"))
     band = band.join(gt, on=["s1_id", "m_src", "m_id"], how="left").with_columns(pl.col("y").fill_null(0.0))
     tr = band.filter(rerank.half_expr(pl) == rerank.RERANK_HALF)
-    if tr.height > RERANK_MAX:
-        tr = tr.sample(RERANK_MAX, seed=config.SEED)
-    if rerank.RERANK_ALL:   # plus some easy pairs, since every pair gets scored
+    cap = RERANK_MAX * 3 // 4 if rerank.RERANK_ALL else RERANK_MAX   # leave room for easy pairs
+    if tr.height > cap:
+        tr = tr.sample(cap, seed=config.SEED)
+    if rerank.RERANK_ALL:   # plus easy pairs (1/3 of the band), since every pair gets scored
         easy = (oof.filter(rerank.half_expr(pl) == rerank.RERANK_HALF)
                 .join(tr.select("s1_id", "m_src", "m_id"), on=["s1_id", "m_src", "m_id"], how="anti")
                 .join(gt, on=["s1_id", "m_src", "m_id"], how="left").with_columns(pl.col("y").fill_null(0.0)))
