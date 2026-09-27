@@ -48,8 +48,7 @@ def training_pairs(all_train=False):
 
 
 def encode_all():
-    out_dir = config.WORK_DIR / "emb"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    embed.emb_path("train", 1).parent.mkdir(parents=True, exist_ok=True)   # tagged dir (BER_TAG)
     for split in config.SPLITS:
         for src in config.SOURCES:
             names = load_records(split, src, ["name"])["name"]

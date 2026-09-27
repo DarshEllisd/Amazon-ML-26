@@ -1,61 +1,81 @@
 #!/bin/bash
-# Unattended remainder of the run (survives the laptop disconnecting).
-# Progress: ~/ml-chall/logs/FINAL_STATUS (one line per step); per-step logs in ~/ml-chall/logs/.
+# Unattended remainder of the run (survives the laptop disconnecting). RESUMABLE:
+# every finished step leaves logs/done_<step>; re-running this script skips those.
+# Progress: ~/ml-chall/logs/FINAL_STATUS; per-step logs: ~/ml-chall/logs/<step>.log
 cd ~/ml-chall && . ./env.sh && cd repo/code/business_entity_resolution
 L=~/ml-chall/logs
 S=$L/FINAL_STATUS
 step() { echo "$(date '+%F %T') $*" >> "$S"; }
-fail() { step "FAILED: $*"; exit 1; }
+fail() { step "FAILED: $1 (see logs/$1.log)"; exit 1; }
 PY="python -u -W ignore"
+RP="$PY src/run_pipeline.py"
 export BER_MAX_NEG=30000000
 score() { grep "decision rule" "$1" | tail -1 | sed 's/.*-> //'; }
 
-step "started"
+# run NAME CMD... : skip if done, else run with its own log, mark done or stop
+run() {
+  local name=$1; shift
+  [ -f $L/done_$name ] && return 0
+  step "start $name"
+  ( "$@" ) > $L/$name.log 2>&1 || fail $name
+  touch $L/done_$name
+  step "done  $name"
+}
 
-# 1. final name encoder on every training pair, on GPU 1, in parallel with the m3 steps
-#    (reuse a run that is already going or finished)
-if pgrep -f "[t]rain_encoder.py --all-train" > /dev/null || grep -q "exit=0" $L/enc_all.log 2>/dev/null; then
-  step "final encoder already running/finished; waiting for it later"
-else
+step "=== orchestrator (re)started"
+
+# final encoder (every training pair) on GPU 1, in the background
+if [ ! -f $L/done_enc_all ]; then
   ( export BER_TAG=all CUDA_VISIBLE_DEVICES=1
-    $PY src/train_encoder.py --all-train > $L/enc_all.log 2>&1; echo "exit=$?" >> $L/enc_all.log ) &
-  step "final encoder training started (GPU 1)"
+    if [ ! -f work/models/name_encoder_all/model.safetensors ]; then
+      $PY src/train_encoder.py --all-train > $L/enc_all.log 2>&1 || exit 1
+    else
+      $PY src/train_encoder.py --encode > $L/enc_all.log 2>&1 || exit 1
+    fi
+    touch $L/done_enc_all ) &
+  step "final encoder running in background (GPU 1)"
 fi
 
-# 2. m3: every fit-fold region, narrow reranker band, scored on val
-rm -rf work/runs/fitall
-step "m3 started"
-( $PY src/run_pipeline.py --run fitall --stage all --model m3 &&
-  $PY src/run_pipeline.py --run val --stage predict --model m3 ) > $L/m3.log 2>&1 || fail "m3 (see logs/m3.log)"
-step "m3 done: val F0.5 $(score $L/m3.log)"
+# m3: every fit-fold region, narrow reranker band, scored on val
+run m3_block    $RP --run fitall --stage block    --model m3
+run m3_features $RP --run fitall --stage features --model m3
+run m3_train    $RP --run fitall --stage train    --model m3
+run m3_rerank   $RP --run fitall --stage rerank   --model m3
+run m3_group    $RP --run fitall --stage group    --model m3
+run m3_val      $RP --run val    --stage predict  --model m3
+step "m3 val F0.5: $(score $L/m3_val.log)"
 
-# 3. same models with the wide reranker band (reranker + stage 2 retrained), val scored
-cp work/models/m3.lgb work/models/m3w.lgb
-step "m3w (wide band) started"
-( export BER_BAND=wide
-  $PY src/run_pipeline.py --run fitall --stage rerank --model m3w &&
-  $PY src/run_pipeline.py --run fitall --stage group --model m3w &&
-  $PY src/run_pipeline.py --run val --stage predict --model m3w ) > $L/m3w.log 2>&1 || fail "m3w (see logs/m3w.log)"
-N=$(score $L/m3.log); W=$(score $L/m3w.log)
-if python -c "import sys; sys.exit(0 if float('$W') > float('$N') else 1)"; then BAND=wide; RULE=m3w; else BAND=narrow; RULE=m3; fi
-step "m3w done: val F0.5 $W (narrow $N) -> using band=$BAND"
+# m3w: reranker + stage 2 retrained with the wide band (stage 1 shared with m3)
+cp -n work/models/m3.lgb work/models/m3w.lgb
+run m3w_rerank env BER_BAND=wide $RP --run fitall --stage rerank  --model m3w
+run m3w_group  env BER_BAND=wide $RP --run fitall --stage group   --model m3w
+run m3w_val    env BER_BAND=wide $RP --run val    --stage predict --model m3w
+if [ ! -f $L/band ]; then
+  N=$(score $L/m3_val.log); W=$(score $L/m3w_val.log)
+  if python -c "import sys; sys.exit(0 if float('$W') > float('$N') else 1)"; then echo wide > $L/band; else echo narrow > $L/band; fi
+  step "val F0.5 wide $W vs narrow $N -> band=$(cat $L/band)"
+fi
+BAND=$(cat $L/band); RULE=$([ "$BAND" = wide ] && echo m3w || echo m3)
 
-# 4. final models on every training record (val regions included), final encoder
-until grep -q "exit=" $L/enc_all.log 2>/dev/null; do sleep 30; done
-grep -q "exit=0" $L/enc_all.log || fail "final encoder (see logs/enc_all.log)"
-step "final encoder done"
+# final models on every training record with the final encoder
+until [ -f $L/done_enc_all ] || ! pgrep -f "[t]rain_encoder.py" > /dev/null; do sleep 30; done
+[ -f $L/done_enc_all ] || fail enc_all
 export BER_TAG=all BER_BAND=$BAND
-$PY src/run_pipeline.py --run all --stage all --model final > $L/final_train.log 2>&1 || fail "final training (see logs/final_train.log)"
+run final_block    $RP --run all --stage block    --model final
+run final_features $RP --run all --stage features --model final
+run final_train    $RP --run all --stage train    --model final
+run final_rerank   $RP --run all --stage rerank   --model final
+run final_group    $RP --run all --stage group    --model final
 cp work/models/${RULE}_tau.json work/models/final_tau.json
-step "final models trained; decision rule from $RULE: $(cat work/models/final_tau.json)"
+step "final decision rule (from $RULE): $(cat work/models/final_tau.json)"
 
-# 5. test predictions
-$PY src/run_pipeline.py --run test --stage all --model final > $L/final_test.log 2>&1 || fail "test run (see logs/final_test.log)"
-step "test predictions written: $(grep 'wrote' $L/final_test.log | tail -1)"
-
-# 6. official validator
+# test predictions + official validator
+run test_block    $RP --run test --stage block    --model final
+run test_features $RP --run test --stage features --model final
+run test_predict  $RP --run test --stage predict  --model final
+step "$(grep 'wrote' $L/test_predict.log | tail -1)"
 R=../../6ab10eb3b23ba_student_resource/student_resource
-python $R/utils/validate_submission.py --matching ../../output/matching_results.tsv \
-  --candidate ../../output/candidate_pairs.tsv --test-dir $R/dataset/test --check-ids > $L/validator.log 2>&1
+run validator python $R/utils/validate_submission.py --matching ../../output/matching_results.tsv \
+  --candidate ../../output/candidate_pairs.tsv --test-dir $R/dataset/test --check-ids
 step "validator: $(tail -1 $L/validator.log)"
-step "ALL DONE"
+step "=== ALL DONE"

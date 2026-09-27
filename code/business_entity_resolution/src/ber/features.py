@@ -118,7 +118,7 @@ def _entity_aggregates(cands, r1, rm, log):
         sims.append(c.select("s1_id").with_columns(pl.Series("sim", sim)))
     log("  entity aggregates done")
     return (pl.concat(sims).group_by("s1_id")
-            .agg(pl.col("sim").max().alias("sim_max_1"), pl.len().cast(pl.Int16).alias("n_cand_1")))
+            .agg(pl.col("sim").max().alias("sim_max_1"), pl.len().cast(pl.Int32).alias("n_cand_1")))
 
 
 def build(cands, s1, m, log=print, sink=None):

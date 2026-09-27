@@ -26,7 +26,7 @@ CHUNK = 5_000_000
 def _p_features(scored):
     return scored.with_columns(
         pl.col("p").rank("ordinal", descending=True).over("m_src", "m_id").cast(pl.Int16).alias("p1_rank_m"),
-        pl.col("p").rank("ordinal", descending=True).over("s1_id").cast(pl.Int16).alias("p1_rank_1"),
+        pl.col("p").rank("ordinal", descending=True).over("s1_id").cast(pl.Int32).alias("p1_rank_1"),
         pl.col("p").sum().over("s1_id").alias("p1_sum_1"),
         pl.len().over("m_src", "m_id").cast(pl.Int16).alias("p1_n_m"),
     ).with_columns(
@@ -67,7 +67,7 @@ def build(scored, m, emb_m=None, log=print, extra=None):
             f["ge"] = np.einsum("ij,ij->i", a.astype(np.float32), b.astype(np.float32))
         parts.append(x.select(KEY).with_columns(**{k: pl.Series(v) for k, v in f.items()}))
     g = pl.concat(parts) if parts else pl.DataFrame(schema={**{k: pl.Int64 for k in KEY}})
-    aggs = [pl.len().cast(pl.Int16).alias("grp_n"),
+    aggs = [pl.len().cast(pl.Int32).alias("grp_n"),
             pl.col("gn").max().alias("grp_name_max"), pl.col("gn").mean().alias("grp_name_mean"),
             pl.col("ga").max().alias("grp_addr_max"), pl.col("ga").mean().alias("grp_addr_mean")]
     if "ge" in g.columns:

@@ -156,10 +156,11 @@ def stage_block(run):
             m.select("m_src", "m_id", "native"), on=["m_src", "m_id"])
         if "rank_emb" in hit.columns:
             log("  recall b5={:.4f}".format((hit["rank_emb"] < 99).mean()))
-        log("  recall b1={:.4f} b2={:.4f} b6={:.4f} native={:.4f} latin={:.4f}".format(
+        rate = lambda x: float("nan") if x is None else x   # e.g. no native-script records in the US
+        log("  recall b1={:.4f} b2={:.4f} b6={:.4f} native={:.4f} latin={:.4f}".format(*map(rate, (
             hit["b1"].fill_null(False).mean(), (hit["rank_name"] < 99).mean(), (hit["rank_addr"] < 99).mean(),
             hit.filter("native")["cos"].is_not_null().mean(),
-            hit.filter(~pl.col("native"))["cos"].is_not_null().mean()))
+            hit.filter(~pl.col("native"))["cos"].is_not_null().mean()))))
 
 
 def load_with_regions(run):
