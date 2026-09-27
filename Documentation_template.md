@@ -21,7 +21,7 @@ We use a multi-stage pipeline: blocking → learned pruning → matching model, 
 
 Results:
 - held-out validation macro F0.5: **0.993** (US 0.993, India 0.993)
-- public leaderboard: [LB_FINAL] (0.9813 with the previous, smaller reranker)
+- public leaderboard: **0.9827**. France uses the smaller e5 reranker; see §4.
 - nothing hard-codes the country set, so France (unseen in training) is handled by country-agnostic features and an unsupervised region lexicon
 
 ---
@@ -149,6 +149,11 @@ Every pass runs **within country**, and within the **region** (state / région) 
    - Fine-tuned for 1 epoch with binary cross-entropy (lr 2e-5, batch 128, bf16) on the pruned pairs of **one half** of the training entities: every pair in the uncertain band (stage-1 p ∈ [0.001, 0.99], plus each record's encoder top-1 candidate) and a third as many easy pairs.
    - It then scores **every** pruned pair, with one model copy per GPU.
    - An earlier version used multilingual-e5-small (118M) on the uncertain band only; validation 0.9877 vs **0.9930** for bge-reranker-v2-m3.
+   - **France:** there are no French labels, so the reranker for France was chosen on the public leaderboard.
+     - We submitted the same US/India predictions with France from each reranker: e5-small **0.98268** vs bge-m3 0.98232 overall. The two differ on 22% of French entities.
+     - So France uses the e5-small reranker (uncertain band, its own stage 2 and decision rule). The US and India use bge-reranker-v2-m3.
+     - Everything else is shared across countries: blocking, stage 1, pruning and the candidate set.
+     - In code, this is `BER_COUNTRY_MODELS` / `DEFAULT_COUNTRY_MODELS` in `run_pipeline.py`.
 4. **Stage 2: LightGBM** on:
    - the stage-1 score and rival gaps: best other S1 for the record, rank per record and per entity, expected entity size
    - the reranker logit
@@ -163,7 +168,11 @@ Every model is MIT/Apache-licensed or our own LightGBM, and all are far below 8B
 2. **Per entity:** sort its remaining candidates by probability p₁ ≥ p₂ ≥ …
    - choose the top-j that maximises expected F0.5 ≈ 1.25·Σᵢ≤ⱼ pᵢ / (0.25·(Σᵢ pᵢ + 1) + j)
    - predict **nothing** when P(no match) ≈ Πᵢ(1−pᵢ) is higher, which handles singletons automatically
-3. Chosen on validation against the best global threshold (0.9930 vs 0.9929). Extra = 0.5 is the expected number of true matches the candidates missed.
+3. Chosen on validation against the best global threshold (0.9930 vs 0.9929). It is applied per country with the rule tuned for that country's reranker:
+   - bge-m3: extra = 0.5
+   - e5-small: extra = 1.0
+
+   Extra is the expected number of true matches the candidates missed.
 
 ---
 
@@ -182,7 +191,7 @@ Every model is MIT/Apache-licensed or our own LightGBM, and all are far below 8B
 | + **bge-reranker-v2-m3** (568M) scoring every pruned pair | **0.993** | **0.993** | **0.993** |
 
   - Precision is 0.9992, recall 0.980, and singleton accuracy 0.995.
-  - **Public leaderboard:** 0.944 (baseline) → 0.9806 (unpruned) → 0.9813 (pruned) → [LB_FINAL] (bge reranker).
+  - **Public leaderboard:** 0.944 (baseline) → 0.9806 (unpruned) → 0.9813 (pruned) → 0.9823 (bge reranker everywhere) → **0.9827** (bge for US/India, e5 for France).
   - **Tried and rejected:** search depth scaled with region size. It raised blocking recall (val 0.9949 → 0.9964), but downstream India F0.5 fell (0.982 → 0.969): the extra look-alike negatives made the models lean on name similarity, which hurts scripts unseen in training. Keeping each record's encoder top-1 candidate through pruning (8.2 candidates/S1) was also worse (0.9853).
 - **Common false positives (wrong merges):** there are few (precision 0.998). Most are **distractor records that look like a real entity**: the same generic name (`Jai Trading`, `Apex Engineering`) at a nearby or partial address, or a record whose address matches a different business in the same building.
 - **Common false negatives (missed matches):**
@@ -255,7 +264,7 @@ Library modules (`src/ber/`):
 | Share | 0.50 | 0.86 | 0.84 | 0.96 | 0.995 |
 
 - **Test predictions:**
-  - matches per S1: India 3.35, US 3.38, France 3.20
-  - share of empty lists: India 6.0%, US 5.8%, France 5.9%
+  - matches per S1: India 3.35, US 3.38, France 3.38
+  - share of empty lists: India 6.0%, US 5.8%, France 5.4%
   - The US/India training mean is 3.5 matches and 5.6% singletons, and France predictions are consistent with that.
 - **Compute:** a single workstation (64 cores, 125 GB RAM, 1× RTX 5090 used at a time). Blocking and scoring run one country per process, so peak RAM stays around 30 GB.

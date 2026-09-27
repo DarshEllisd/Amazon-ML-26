@@ -228,8 +228,32 @@ RERANK_MAX = int(os.environ.get("BER_RERANK_MAX", 3_000_000))
 PRUNE_P1 = float(os.environ.get("BER_PRUNE_P1", 1e-4))
 
 
-# decision rule selected on validation (expected-F0.5 set selection beat every global threshold)
-FINAL_RULE = {"rule": "ef", "extra": 0.5, "tau": 0.65}
+# decision rules selected on validation per reranker (expected-F0.5 set selection beat every
+# global threshold); used when the model has no {model}_tau.json from a val run
+FINAL_RULES = {"bge-m3": {"rule": "ef", "extra": 0.5, "tau": 0.65},
+               "e5-small": {"rule": "ef", "extra": 1.0, "tau": 0.55}}
+# France has no labels: its reranker was chosen on the public leaderboard
+# (e5-small 0.98268 vs bge-m3 0.98232 overall, identical US/India predictions)
+DEFAULT_COUNTRY_MODELS = "France=final_e5:e5-small"
+
+
+def country_models(spec=None):
+    """"France=final_e5:e5-small,..." -> {country: (model, rerank kind)} (BER_COUNTRY_MODELS)."""
+    if spec is None:
+        spec = os.environ.get("BER_COUNTRY_MODELS", DEFAULT_COUNTRY_MODELS)
+    out = {}
+    for item in filter(None, (x.strip() for x in spec.split(","))):
+        country, rest = item.split("=", 1)
+        model, _, kind = rest.partition(":")
+        out[country.strip()] = (model.strip(), kind.strip() or None)
+    return out
+
+
+def rule_for(model_name, kind):
+    import json
+    from ber import rerank
+    path = MODEL_DIR / f"{model_name}_tau.json"
+    return json.loads(path.read_text()) if path.exists() else FINAL_RULES[kind or rerank.KIND]
 PRUNE_KEEP_ECOS1 = os.environ.get("BER_PRUNE_KEEP_ECOS1", "0") == "1"   # val: worse (0.9853 vs 0.9877)
 
 
@@ -327,15 +351,15 @@ def _pair_texts(split, pairs):
     return x["a"].fill_null("").to_list(), x["b"].fill_null("").to_list()
 
 
-def _rerank_frame(split, scored):
-    """Cross-encoder logits `xe` for the uncertain band of stage-1 scores (or None)."""
+def _rerank_frame(split, scored, kind=None):
+    """Cross-encoder logits `xe` for the pairs the reranker scores (or None)."""
     from ber import rerank
-    if os.environ.get("BER_NO_RERANK") or not (rerank.model_dir() / "head.pt").exists():
+    if os.environ.get("BER_NO_RERANK") or not (rerank.model_dir(kind) / "head.pt").exists():
         return None
-    band = scored.filter(rerank.in_band(pl, scored.columns)).select("s1_id", "m_src", "m_id")
-    log(f"  reranking {band.height:,} band pairs of {scored.height:,}")
+    band = scored.filter(rerank.in_band(pl, scored.columns, kind=kind)).select("s1_id", "m_src", "m_id")
+    log(f"  reranking ({kind or rerank.KIND}) {band.height:,} band pairs of {scored.height:,}")
     a, b = _pair_texts(split, band)
-    return band.with_columns(pl.Series("xe", rerank.score(a, b, log=log)))
+    return band.with_columns(pl.Series("xe", rerank.score(a, b, log=log, kind=kind)))
 
 
 def stage_rerank(run):
@@ -407,14 +431,14 @@ def stage_group(run):
     log("stage 2 top features: " + ", ".join(f"{c}={v:.0f}" for c, v in imp[:10]))
 
 
-def _apply_group(split, scored, m):
+def _apply_group(split, scored, m, model_name=None, kind=None):
     """Replace stage-1 p by the stage-2 probability when a stage-2 model exists."""
     import lightgbm as lgb
-    path = MODEL_DIR / f"{MODEL_NAME}_g.lgb"
+    path = MODEL_DIR / f"{model_name or MODEL_NAME}_g.lgb"
     if not path.exists() or os.environ.get("BER_NO_GROUP"):
         return scored
     model = lgb.Booster(model_file=str(path))
-    extra = _rerank_frame(split, scored) if "xe" in model.feature_name() else None
+    extra = _rerank_frame(split, scored, kind) if "xe" in model.feature_name() else None
     g = _group_frame(split, scored, m, extra)
     if "xe" in model.feature_name() and "xe" not in g.columns:
         g = g.with_columns(pl.lit(None, pl.Float32).alias("xe"))
@@ -437,14 +461,22 @@ def stage_predict(run):
         s1 = pl.read_parquet(config.norm_path("test", 1), columns=["id", "country"]).rename({"id": "s1_id"})
         parts = sorted((config.run_dir(run) / "country").glob("*/scored.parquet"))
         log("merging " + ", ".join(p.parent.name for p in parts))
-        merged = []
+        overrides = country_models()
+        merged, preds, rules = [], [], {}
         for p in parts:
+            country = p.parent.name
+            model_c, kind_c = overrides.get(country, (MODEL_NAME, None))
+            if not (MODEL_DIR / f"{model_c}_g.lgb").exists():
+                model_c, kind_c = MODEL_NAME, None     # override not trained: default model
             sc = _prune(pl.read_parquet(p))
-            if (MODEL_DIR / f"{MODEL_NAME}_g.lgb").exists():
-                COUNTRY = p.parent.name
+            if (MODEL_DIR / f"{model_c}_g.lgb").exists():
+                COUNTRY = country
                 _, _, mc = load_with_regions(run)
-                sc = _apply_group(split, sc, mc)
+                sc = _apply_group(split, sc, mc, model_c, kind_c)
                 COUNTRY = None
+            rules[country] = (model_c, kind_c, rule_for(model_c, kind_c))
+            log(f"  {country}: model {model_c}, reranker {kind_c or 'default'}, rule {rules[country][2]}")
+            preds.append(apply_rule(sc, rules[country][2]))
             merged.append(sc.select("s1_id", "m_src", "m_id", "p"))
         scored = pl.concat(merged)
     else:
@@ -467,10 +499,9 @@ def stage_predict(run):
             tau_path.write_text(json.dumps(rule))
         print(report(apply_rule(scored, rule), gt, ents, by="country"))
     else:
-        # decision rule tuned on the validation regions (see README); a val run writes tau_path
-        rule = json.loads(tau_path.read_text()) if tau_path.exists() else FINAL_RULE
-        tau = rule["tau"]
-        pred = apply_rule(scored, rule)
+        # per-country decisions (records never cross countries); rules tuned on validation
+        rule = {c: {"model": mc, "reranker": kc, **r} for c, (mc, kc, r) in rules.items()}
+        pred = pl.concat(preds)
         cand = scored.select("s1_id", "m_src", "m_id")
         assert pred.join(cand, on=["s1_id", "m_src", "m_id"], how="anti").height == 0
         write_pair_table(config.OUTPUT_DIR / "matching_results.tsv", s1["s1_id"], pred, "matched_entity_ids")

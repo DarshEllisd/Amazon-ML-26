@@ -6,7 +6,7 @@ records. It writes `output/matching_results.tsv` (the leaderboard file) and
 `Documentation_template.md` at the package root.
 
 **Results:** held-out validation macro F0.5 is **0.993** (US 0.993, India 0.993; 285k S1 entities in
-held-out regions). The public leaderboard gave 0.9813 for the previous, smaller-reranker version. The
+held-out regions). The public leaderboard score is **0.9827**, with France using the smaller e5 reranker (below). The
 candidate set is ~5.7 pairs per S1 entity on validation (7.4 on test) after learned pruning, where the
 average entity has 3.5 true matches.
 
@@ -52,6 +52,10 @@ bash src/reproduce.sh --validate   # also the held-out validation experiment (+~
 | 4. Train all models | `BER_TAG=all python src/run_pipeline.py --run all --stage all --model final` | `work/models/final*.lgb`, `work/models/reranker_all/` |
 | 5. Predict test | `BER_TAG=all python src/run_pipeline.py --run test --stage all --model final` | `output/*.tsv` |
 
+**Reproducibility:** a full rerun gives the same candidate set byte for byte. It can differ from the submitted
+matches in a handful of borderline pairs, because of GPU floating-point differences in reranker scoring (batch
+composition changes with the number of GPUs). Regenerating on our workstation changed 1 of 1,732,544 rows.
+
 `run_pipeline.py` runs the stages `block → features → train → rerank → group` on a training
 universe, and `block → features → predict` on `val`/`test`. Any single stage can be re-run with
 `--stage`.
@@ -67,6 +71,9 @@ Large universes are blocked one country per subprocess to bound memory.
 
 The final settings are the code defaults:
 - cross-encoder `bge-reranker-v2-m3` scoring every pruned pair (`BER_RERANK_MODEL`, `BER_RERANK_ALL`)
+- **France** uses the `final_e5` models instead: the e5-small reranker on the uncertain band, with its own stage 2 and rule
+  (`DEFAULT_COUNTRY_MODELS` / `BER_COUNTRY_MODELS="France=final_e5:e5-small"`). France has no labels, so this was chosen on
+  the public leaderboard: 0.98268 vs 0.98232 with bge for France, with identical US/India predictions.
 - learned pruning at stage-1 p ≥ 1e-4 (`BER_PRUNE_P1`)
 - expected-F0.5 decision rule, extra = 0.5 (`FINAL_RULE` in `run_pipeline.py`, selected on validation)
 

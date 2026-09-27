@@ -7,7 +7,7 @@
 #
 # Data location: BER_DATA_DIR (default ../../6ab10eb3b23ba_student_resource/student_resource/dataset),
 # outputs: BER_OUTPUT_DIR (default ../../output), intermediates: BER_WORK_DIR (default work/).
-# Needs a CUDA GPU (tested: RTX 5090 32 GB; ~12 GB used) and ~64 GB RAM (peak ~30 GB observed).
+# Needs a CUDA GPU (tested: 2x RTX 5090 32 GB; up to ~19 GB used while training the reranker) and ~64 GB RAM (peak ~30 GB observed).
 set -euo pipefail
 PY="python -u -W ignore"
 
@@ -30,11 +30,18 @@ export BER_TAG=all
 $PY src/train_encoder.py --all-train
 
 # 4. final models on every training record: blocking, features, stage-1 LightGBM
-#    (+ out-of-fold scores), learned pruning, cross-encoder reranker, stage-2 group model (~2.5 h)
+#    (+ out-of-fold scores), learned pruning, bge-reranker-v2-m3, stage-2 group model (~3 h)
 $PY src/run_pipeline.py --run all --stage all --model final
+
+# 4b. France model: same stage 1, e5-small reranker on the uncertain band + its stage 2 (~40 min).
+#     France has no labels; this reranker beat bge-m3 for France on the public leaderboard.
+cp work/models/final.lgb work/models/final_e5.lgb
+BER_RERANK_MODEL=e5-small $PY src/run_pipeline.py --run all --stage rerank --model final_e5
+BER_RERANK_MODEL=e5-small $PY src/run_pipeline.py --run all --stage group  --model final_e5
 
 # 5. test: blocking + features + stage 1 per country, pruning, reranker, stage 2, decision
 #    rule -> output/matching_results.tsv and output/candidate_pairs.tsv                  (~1 h)
+#    (France uses final_e5, set by DEFAULT_COUNTRY_MODELS / BER_COUNTRY_MODELS)
 $PY src/run_pipeline.py --run test --stage all --model final
 
 # 6. official validator

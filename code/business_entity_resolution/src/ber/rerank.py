@@ -33,19 +33,30 @@ MODELS = {  # name -> (checkpoint, train batch, learning rate, micro-batches per
     "e5-small": (BASE_MODEL, 256, 5e-5, 1),
     "bge-m3": ("BAAI/bge-reranker-v2-m3", 128, 2e-5, 2),   # 2 x 64: fits 32 GB with headroom
 }
-RERANK_ALL = os.environ.get("BER_RERANK_ALL", "1") == "1"
 
 
-def model_dir():
-    kind = "" if KIND == "e5-small" else f"_{KIND}"
-    return config.WORK_DIR / "models" / f"reranker{config.tag_suffix()}{kind}"
+def rerank_all(kind=None):
+    """Score every pruned pair (bge-m3) or only the uncertain band (e5-small), as each was
+    validated; BER_RERANK_ALL=0/1 overrides."""
+    if "BER_RERANK_ALL" in os.environ:
+        return os.environ["BER_RERANK_ALL"] == "1"
+    return (kind or KIND) == "bge-m3"
 
 
-def in_band(pl, columns, band_only=False):
+RERANK_ALL = rerank_all()
+
+
+def model_dir(kind=None):
+    kind = kind or KIND
+    suffix = "" if kind == "e5-small" else f"_{kind}"
+    return config.WORK_DIR / "models" / f"reranker{config.tag_suffix()}{suffix}"
+
+
+def in_band(pl, columns, band_only=False, kind=None):
     """Pairs worth a cross-encoder look: uncertain stage-1 p, or the name encoder's
     top candidate for the record even when stage 1 is sure it is not a match
     (cross-script names the pairwise features cannot see)."""
-    if RERANK_ALL and not band_only:
+    if rerank_all(kind) and not band_only:
         return pl.lit(True)
     cond = pl.col("p").is_between(*BAND)
     if "ecos_rank_m" in columns and os.environ.get("BER_BAND", "wide") == "wide":
@@ -126,18 +137,18 @@ def train(a, b, y, epochs=1, batch_size=None, lr=None, device="cuda", log=print)
     return out
 
 
-def _load_for_scoring(device):
-    saved = torch.load(model_dir() / "head.pt", map_location="cpu")
-    model = CrossEncoder(str(model_dir()), kind=saved.get("kind", "e5-small"))
+def _load_for_scoring(device, kind=None):
+    saved = torch.load(model_dir(kind) / "head.pt", map_location="cpu")
+    model = CrossEncoder(str(model_dir(kind)), kind=saved.get("kind", "e5-small"))
     if model.kind == "e5-small":
         model.head.load_state_dict(saved["head"])
     return model.to(device).eval().half()
 
 
 @torch.no_grad()
-def _score_shard(a, b, idx_all, device, batch_size, out, log):
-    tok = _tok(str(model_dir()))
-    model = _load_for_scoring(device)
+def _score_shard(a, b, idx_all, device, batch_size, out, log, kind=None):
+    tok = _tok(str(model_dir(kind)))
+    model = _load_for_scoring(device, kind)
     t0 = time.time()
     for k, i in enumerate(range(0, len(idx_all), batch_size)):
         idx = idx_all[i:i + batch_size]
@@ -149,7 +160,7 @@ def _score_shard(a, b, idx_all, device, batch_size, out, log):
                 f"({time.time() - t0:.0f}s)")
 
 
-def score(a, b, batch_size=1024, log=print):
+def score(a, b, batch_size=1024, log=print, kind=None):
     """Match logits for aligned text lists a, b. With several GPUs, each GPU gets its own
     model copy and an interleaved share of the (length-sorted) pairs: no GPU-to-GPU traffic
     (torch DataParallel crashed with illegal memory access on the 2x RTX 5090 box)."""
@@ -159,6 +170,6 @@ def score(a, b, batch_size=1024, log=print):
     n_gpu = max(1, torch.cuda.device_count())
     shards = [order[g::n_gpu] for g in range(n_gpu)]
     with ThreadPoolExecutor(n_gpu) as ex:
-        list(ex.map(lambda g: _score_shard(a, b, shards[g], f"cuda:{g}", batch_size, out, log),
+        list(ex.map(lambda g: _score_shard(a, b, shards[g], f"cuda:{g}", batch_size, out, log, kind),
                     range(n_gpu)))
     return out
