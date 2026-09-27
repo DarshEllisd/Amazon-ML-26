@@ -1,55 +1,122 @@
-# Business Entity Resolution — pipeline
+# Business Entity Resolution: pipeline (team momos)
 
-Amazon ML Challenge 2026. Links every Source 1 business to its matching Source 2 / Source 3
-records. See `../../PLAN.md` for the full approach.
+Amazon ML Challenge 2026. For every Source 1 business, finds its matching Source 2 / Source 3
+records. It writes `output/matching_results.tsv` (the leaderboard file) and
+`output/candidate_pairs.tsv` (the exact pairs the matching model scores). The methodology is in
+`Documentation_template.md` at the package root.
+
+**Results:** held-out validation macro F0.5 is **0.988** (US 0.992, India 0.982; 285k S1 entities in
+held-out regions). The public leaderboard gave **0.9806** for the unpruned version. The candidate set
+is ~5.7 pairs per S1 entity after learned pruning, where the average entity has 3.5 true matches.
 
 ## Setup
 
+Python 3.9. The pipeline is tested on Ubuntu 24.04 (64 cores, 125 GB RAM, RTX 5090) and on Windows 11.
+
 ```bash
+pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128   # CUDA build (RTX 50xx needs cu128)
 pip install -r requirements.txt
 ```
 
-By default the raw data is read from
-`../../6ab10eb3b23ba_student_resource/student_resource/dataset/{train,test}/`.
-Override paths with the environment variables `BER_DATA_DIR`, `BER_WORK_DIR` (intermediate
-files, default `work/`) and `BER_OUTPUT_DIR` (default `../../output/`).
+**Hardware for the full run:**
+- a CUDA GPU: about 12 GB of GPU memory is used, for top-k search, encoder training and reranking
+- 64 GB RAM recommended; the observed peak is about 30 GB, because blocking runs one country per process
 
-## Run (from this directory)
+The only download is the pretrained `intfloat/multilingual-e5-small` weights (MIT licence). They come
+from the Hugging Face hub on first use and are cached under `HF_HOME`. No other external data or
+service is used.
 
-| Step | Command | Output | Time* |
-|---|---|---|---|
-| 0. Parquet cache | `python src/prepare_data.py` | `work/parquet/` | ~25 s |
-| 1. Validation split | `python src/make_split.py` | `work/split/` | ~30 s |
-| 2. Normalise | `python src/normalize_data.py` | `work/norm/` | ~20 min |
-| 3. Train matcher | `python src/run_pipeline.py --run fit --stage all` | `work/models/m1.lgb` | ~35 min |
-| 4. Hold-out + threshold | `python src/run_pipeline.py --run val --stage all` | `work/models/m1_tau.json`, report | ~30 min |
-| 5. Test predictions | `python src/run_pipeline.py --run test --stage all` | `output/matching_results.tsv`, `output/candidate_pairs.tsv` | see below |
+**Paths:**
+- The raw data is read from `../../6ab10eb3b23ba_student_resource/student_resource/dataset/{train,test}/` by default.
+- Override the locations with `BER_DATA_DIR` (raw TSVs), `BER_WORK_DIR` (intermediate files, default `work/`)
+  and `BER_OUTPUT_DIR` (default `../../output/`).
 
-Each `run_pipeline.py` run has the stages `block` → `features` → `train` (fit only) / `predict`,
-which can also be run one at a time with `--stage`. `--run mini` is a 58k-entity subset of val for
-fast iteration. Blocking uses the GPU through torch when CUDA is available (strongly recommended on
-test); otherwise it falls back to scipy.
+## Reproduce the submission
 
-\*16 GB RAM / 12-core laptop.
+Run this from this directory. It regenerates both output files from the raw data and then runs the
+official validator:
+
+```bash
+bash src/reproduce.sh              # ~4.5 h on the machine above
+bash src/reproduce.sh --validate   # also the held-out validation experiment (+~2.5 h)
+```
+
+| Step | Command (inside `reproduce.sh`) | Output |
+|---|---|---|
+| 0. Parquet cache | `python src/prepare_data.py` | `work/parquet/` |
+| 1. Validation split | `python src/make_split.py` | `work/split/` |
+| 2. Normalise names/addresses | `python src/normalize_data.py` | `work/norm/` |
+| 3. Name encoder | `BER_TAG=all python src/train_encoder.py --all-train` | `work/models/name_encoder_all/`, `work/emb_all/` |
+| 4. Train all models | `BER_TAG=all python src/run_pipeline.py --run all --stage all --model final` | `work/models/final*.lgb`, `work/models/reranker_all/` |
+| 5. Predict test | `BER_TAG=all python src/run_pipeline.py --run test --stage all --model final` | `output/*.tsv` |
+
+`run_pipeline.py` runs the stages `block → features → train → rerank → group` on a training
+universe, and `block → features → predict` on `val`/`test`. Any single stage can be re-run with
+`--stage`.
+
+**Universes:**
+- `all`: every training record (used for the final models)
+- `fitall`: the fit-fold regions
+- `val`: the held-out regions
+- `mini`: a small val subset
+- `test`
+
+Large universes are blocked one country per subprocess to bound memory.
+
+The final settings are the code defaults:
+- reranker band `wide` (`BER_BAND`)
+- learned pruning at stage-1 p ≥ 1e-4 (`BER_PRUNE_P1`)
+- expected-F0.5 decision rule, extra = 1.0 (`FINAL_RULE` in `run_pipeline.py`, selected on validation)
+
+`BER_JOBS` caps the CPU workers. LightGBM uses at most 32 threads, because more was much slower on
+64 cores.
 
 Tests: `python -m pytest -q tests`
 
+## Pipeline
+
+1. **Normalisation** (`ber/normalize.py`):
+   - ASCII fold and transliteration of native scripts (anyascii)
+   - junk wrappers, leet/OCR fixes and legal-form extraction for names
+   - canonical street types and ordinals, and `number|token` address keys
+2. **Regions** (`ber/geo.py`, `ber/blocking.py`):
+   - S1 region = its most frequent address component
+   - S2/S3 regions come from a lexicon learned on *pseudo-links* (exact address-key matches with near-identical names). No labels are used, so it also works for France (région ↔ département).
+3. **Blocking** (`ber/blocking.py`, `ber/topk.py`, `ber/embed.py`). Every pass runs within (country, region) and gives top-k per S2/S3 record, on the GPU:
+   - B1: address keys
+   - B2: name char-3-gram TF-IDF
+   - B6: address word TF-IDF
+   - B5: fine-tuned multilingual name-encoder embeddings
+
+   Records without a region search the whole country.
+4. **Stage 1** (`ber/features.py` + LightGBM):
+   - ~45 pairwise features: rapidfuzz name/address similarities, number overlap, legal-form agreement, TF-IDF and encoder cosines
+   - competition features: gap and rank against the other candidates of the same record
+5. **Learned pruning:** pairs with stage-1 p < 1e-4 are dropped. The remaining pairs are `candidate_pairs.tsv`, and nothing after this point sees any other pair.
+6. **Cross-encoder reranker** (`ber/rerank.py`): multilingual-e5-small reads `name | address` of both records. It scores the uncertain band plus the encoder's top-1 candidate of each record. It is trained on one half of the entities; stage 2 learns how far to trust it on the other half.
+7. **Stage 2** (`ber/group.py` + LightGBM):
+   - out-of-fold stage-1 scores and rival-S1 gaps
+   - the reranker logit
+   - similarity of each record to the entity's *other* confident matches
+8. **Decision** (`ber/assign.py`):
+   - each S2/S3 record goes to at most its single best S1
+   - per entity, choose the prefix of candidates that maximises expected F0.5; this handles singletons too
+
 ## Layout
 
-- `src/ber/config.py`: paths and constants
-- `src/ber/io.py`: TSV/parquet loading, submission writer (IDs kept as `(src, int)`)
-- `src/ber/evaluate.py`: exact macro F0.5 (with the singleton rule), blocking recall/oracle report
-- `src/ber/geo.py`: country-agnostic region detection (most frequent address component), region lexicon learned from linked records
-- `src/ber/normalize.py`: name/address normalisation (ASCII fold + transliteration, junk, leet, legal forms, street types, house-number keys)
-- `src/ber/blocking.py`: candidate generation: B1 address keys, B2 name char-3-gram TF-IDF, B6 address word TF-IDF, within (country, region); S2/S3 regions from an unsupervised pseudo-link lexicon
-- `src/ber/topk.py`: sparse top-k cosine search (GPU via torch, scipy fallback)
-- `src/ber/features.py`: pair + competition features (rapidfuzz), streamed per bucket of S2/S3 records
-- `src/ber/assign.py`: exclusive assignment (each S2/S3 record to at most its best S1) + threshold
-- `src/prepare_data.py`, `src/make_split.py`, `src/normalize_data.py`, `src/run_pipeline.py`: pipeline entry points
+- `src/ber/`: library modules
+  - `config`, `io`, `evaluate` (exact macro F0.5), `geo`, `normalize`, `topk`, `blocking`, `embed`, `features`, `rerank`, `group`, `assign`
+- `src/prepare_data.py`, `src/make_split.py`, `src/normalize_data.py`, `src/train_encoder.py`, `src/run_pipeline.py`, `src/reproduce.sh`: entry points
+- `tests/`: unit tests for the evaluator, normalisers, top-k search and decision rules
 
 ## Validation protocol
 
-Whole regions are held out (with all their S1/S2/S3 records, including distractors), about 10% of S1
-per country: US `ny, ky, ia`; India `kerala, tamil nadu`, giving 253k S1 entities. `mini` (`ia` + `kerala`,
-58k entities) is used for fast iteration. The fit and val folds have matching singleton rates (5.5–5.6%),
-mean matches (3.46) and distractor rates (25–27%).
+Whole regions are held out, with all their S1/S2/S3 records and distractors:
+- US: `ny, nd, az`
+- India: `kerala, tamil nadu`
+
+That's 285k S1 entities, about 12% per country. The fit and val folds have matching singleton rates,
+mean match counts and distractor rates.
+
+Holding out Tamil Nadu and Kerala also withholds most Tamil- and Malayalam-script names from
+training, so validation understates India. The final models train on every region.

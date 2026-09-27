@@ -221,6 +221,31 @@ MODEL_DIR = config.WORK_DIR / "models"
 LGB_THREADS = min(config.N_JOBS, 32)   # LightGBM slows down with too many threads
 MODEL_NAME = "m1"     # set by --model
 RERANK_MAX = int(os.environ.get("BER_RERANK_MAX", 3_000_000))
+# Learned pruning: stage 1 (LightGBM on the blocking/similarity features) is the last
+# filtering stage of candidate generation. Pairs below PRUNE_P1 are dropped, and the
+# matching model (cross-encoder + stage 2) only ever sees, and candidate_pairs.tsv
+# only contains, the pairs that survive. 0 disables it.
+PRUNE_P1 = float(os.environ.get("BER_PRUNE_P1", 1e-4))
+
+
+# decision rule selected on validation (expected-F0.5 set selection beat every global threshold)
+FINAL_RULE = {"rule": "ef", "extra": 1.0, "tau": 0.55}
+PRUNE_KEEP_ECOS1 = os.environ.get("BER_PRUNE_KEEP_ECOS1", "0") == "1"   # val: worse (0.9853 vs 0.9877)
+
+
+def _prune(scored):
+    """Keep pairs with stage-1 p >= PRUNE_P1, plus (by default) each record's top
+    candidate by the multilingual name encoder: cross-script names that stage 1
+    rules out but the cross-encoder can still recognise."""
+    if PRUNE_P1 <= 0:
+        return scored
+    keep = pl.col("p") >= PRUNE_P1
+    if PRUNE_KEEP_ECOS1 and "ecos_rank_m" in scored.columns:
+        keep = keep | (pl.col("ecos_rank_m") == 1)
+    kept = scored.filter(keep)
+    log(f"  learned pruning p1>={PRUNE_P1:g}{' + encoder top-1' if PRUNE_KEEP_ECOS1 else ''}: "
+        f"kept {kept.height:,} of {scored.height:,} pairs")
+    return kept
 MAX_NEG = int(os.environ.get("BER_MAX_NEG", 8_000_000))
 LGB_PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=255, min_data_in_leaf=100,
                   feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
@@ -319,7 +344,7 @@ def stage_rerank(run):
     assert _is_train_run(run), "train the reranker on a fit universe"
     split = "train"
     d = rdir(run)
-    oof = pl.read_parquet(d / "scored_oof.parquet")
+    oof = _prune(pl.read_parquet(d / "scored_oof.parquet"))
     band = oof.filter(rerank.in_band(pl, oof.columns))
     gt = load_gt_pairs().with_columns(pl.lit(1.0).alias("y"))
     band = band.join(gt, on=["s1_id", "m_src", "m_id"], how="left").with_columns(pl.col("y").fill_null(0.0))
@@ -347,7 +372,7 @@ def stage_group(run):
     assert _is_train_run(run), "train stage 2 on a fit universe"
     split, s1, m = load_with_regions(run)
     d = rdir(run)
-    scored = pl.read_parquet(d / "scored_oof.parquet")
+    scored = _prune(pl.read_parquet(d / "scored_oof.parquet"))
     extra = None
     if (d / "rerank_oof.parquet").exists() and not os.environ.get("BER_NO_RERANK"):
         from ber import rerank
@@ -403,7 +428,7 @@ def stage_predict(run):
         log("merging " + ", ".join(p.parent.name for p in parts))
         merged = []
         for p in parts:
-            sc = pl.read_parquet(p)
+            sc = _prune(pl.read_parquet(p))
             if (MODEL_DIR / f"{MODEL_NAME}_g.lgb").exists():
                 COUNTRY = p.parent.name
                 _, _, mc = load_with_regions(run)
@@ -415,9 +440,11 @@ def stage_predict(run):
         split, s1, m = load_with_regions(run)
         scored = _score(_load_model(), pl.read_parquet(d / "features.parquet"))
         scored.write_parquet(d / "scored.parquet")
-        scored = _apply_group(split, scored, m)
+        scored = _apply_group(split, _prune(scored), m)
         scored.write_parquet(d / f"scored_final_{MODEL_NAME}.parquet")
     tau_path = MODEL_DIR / f"{MODEL_NAME}_tau.json"
+    log(f"candidate pairs scored by the matching model: {scored.height:,} "
+        f"({scored.height / s1.height:.2f} per S1 entity)")
     if split == "train":
         gt = universe_gt(s1, m)
         ents = s1.select("s1_id", "country")
@@ -429,7 +456,8 @@ def stage_predict(run):
             tau_path.write_text(json.dumps(rule))
         print(report(apply_rule(scored, rule), gt, ents, by="country"))
     else:
-        rule = json.loads(tau_path.read_text())
+        # decision rule tuned on the validation regions (see README); a val run writes tau_path
+        rule = json.loads(tau_path.read_text()) if tau_path.exists() else FINAL_RULE
         tau = rule["tau"]
         pred = apply_rule(scored, rule)
         cand = scored.select("s1_id", "m_src", "m_id")

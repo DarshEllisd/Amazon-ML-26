@@ -22,9 +22,9 @@ from . import config
 from .embed import BASE_MODEL
 
 MAX_LEN = 128
-# BER_BAND=narrow: stage-1 p in [0.01, 0.99]; wide: [0.001, 0.99] plus the name encoder's top-1
-# candidate of each record (cross-script names stage 1 wrongly rules out)
-BAND = (0.001, 0.99) if os.environ.get("BER_BAND", "narrow") == "wide" else (0.01, 0.99)
+# BER_BAND=wide (default; val 0.9881 vs 0.9845 narrow): stage-1 p in [0.001, 0.99] plus the
+# name encoder's top-1 candidate of each record; narrow: p in [0.01, 0.99]
+BAND = (0.001, 0.99) if os.environ.get("BER_BAND", "wide") == "wide" else (0.01, 0.99)
 RERANK_HALF = 0           # fit entities with hash(s1_id) % 2 == RERANK_HALF train the reranker
 
 
@@ -37,7 +37,7 @@ def in_band(pl, columns):
     top candidate for the record even when stage 1 is sure it is not a match
     (cross-script names the pairwise features cannot see)."""
     cond = pl.col("p").is_between(*BAND)
-    if "ecos_rank_m" in columns and os.environ.get("BER_BAND", "narrow") == "wide":
+    if "ecos_rank_m" in columns and os.environ.get("BER_BAND", "wide") == "wide":
         cond = cond | ((pl.col("ecos_rank_m") == 1) & (pl.col("p") < BAND[1]))
     return cond
 
