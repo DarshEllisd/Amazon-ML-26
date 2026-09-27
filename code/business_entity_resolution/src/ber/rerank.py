@@ -28,12 +28,12 @@ MAX_LEN = 128
 # name encoder's top-1 candidate of each record; narrow: p in [0.01, 0.99]
 BAND = (0.001, 0.99) if os.environ.get("BER_BAND", "wide") == "wide" else (0.01, 0.99)
 RERANK_HALF = 0           # fit entities with hash(s1_id) % 2 == RERANK_HALF train the reranker
-KIND = os.environ.get("BER_RERANK_MODEL", "e5-small")
+KIND = os.environ.get("BER_RERANK_MODEL", "bge-m3")   # val: bge-m3 0.9930 vs e5-small 0.9877
 MODELS = {  # name -> (checkpoint, train batch, learning rate)
     "e5-small": (BASE_MODEL, 256, 5e-5),
     "bge-m3": ("BAAI/bge-reranker-v2-m3", 128, 2e-5),
 }
-RERANK_ALL = os.environ.get("BER_RERANK_ALL", "0") == "1"
+RERANK_ALL = os.environ.get("BER_RERANK_ALL", "1") == "1"
 
 
 def model_dir():
@@ -41,11 +41,11 @@ def model_dir():
     return config.WORK_DIR / "models" / f"reranker{config.tag_suffix()}{kind}"
 
 
-def in_band(pl, columns):
+def in_band(pl, columns, band_only=False):
     """Pairs worth a cross-encoder look: uncertain stage-1 p, or the name encoder's
     top candidate for the record even when stage 1 is sure it is not a match
     (cross-script names the pairwise features cannot see)."""
-    if RERANK_ALL:
+    if RERANK_ALL and not band_only:
         return pl.lit(True)
     cond = pl.col("p").is_between(*BAND)
     if "ecos_rank_m" in columns and os.environ.get("BER_BAND", "wide") == "wide":
@@ -125,26 +125,39 @@ def train(a, b, y, epochs=1, batch_size=None, lr=None, device="cuda", log=print)
     return out
 
 
-@torch.no_grad()
-def score(a, b, batch_size=1024, device="cuda", log=print):
-    """Match logits for aligned text lists a, b."""
-    tok = _tok(str(model_dir()))
+def _load_for_scoring(device):
     saved = torch.load(model_dir() / "head.pt", map_location="cpu")
     model = CrossEncoder(str(model_dir()), kind=saved.get("kind", "e5-small"))
     if model.kind == "e5-small":
         model.head.load_state_dict(saved["head"])
-    model = model.to(device).eval().half()
-    if torch.cuda.device_count() > 1:          # split each batch across the GPUs
-        model = torch.nn.DataParallel(model)
-        batch_size *= torch.cuda.device_count()
-    order = np.argsort([len(x) + len(z) for x, z in zip(a, b)], kind="stable")
-    out = np.empty(len(a), dtype=np.float32)
+    return model.to(device).eval().half()
+
+
+@torch.no_grad()
+def _score_shard(a, b, idx_all, device, batch_size, out, log):
+    tok = _tok(str(model_dir()))
+    model = _load_for_scoring(device)
     t0 = time.time()
-    for k, i in enumerate(range(0, len(a), batch_size)):
-        idx = order[i:i + batch_size]
+    for k, i in enumerate(range(0, len(idx_all), batch_size)):
+        idx = idx_all[i:i + batch_size]
         batch = tok([a[j] for j in idx], [b[j] for j in idx], padding=True, truncation=True,
                     max_length=MAX_LEN, return_tensors="pt").to(device)
         out[idx] = model(dict(batch)).float().cpu().numpy()
         if k % 200 == 0:
-            log(f"  reranked {min(i + batch_size, len(a)):,}/{len(a):,} ({time.time() - t0:.0f}s)")
+            log(f"  [{device}] reranked {min(i + batch_size, len(idx_all)):,}/{len(idx_all):,} "
+                f"({time.time() - t0:.0f}s)")
+
+
+def score(a, b, batch_size=1024, log=print):
+    """Match logits for aligned text lists a, b. With several GPUs, each GPU gets its own
+    model copy and an interleaved share of the (length-sorted) pairs: no GPU-to-GPU traffic
+    (torch DataParallel crashed with illegal memory access on the 2x RTX 5090 box)."""
+    from concurrent.futures import ThreadPoolExecutor
+    order = np.argsort([len(x) + len(z) for x, z in zip(a, b)], kind="stable")
+    out = np.empty(len(a), dtype=np.float32)
+    n_gpu = max(1, torch.cuda.device_count())
+    shards = [order[g::n_gpu] for g in range(n_gpu)]
+    with ThreadPoolExecutor(n_gpu) as ex:
+        list(ex.map(lambda g: _score_shard(a, b, shards[g], f"cuda:{g}", batch_size, out, log),
+                    range(n_gpu)))
     return out

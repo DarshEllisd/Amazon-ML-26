@@ -16,12 +16,12 @@ We use a multi-stage pipeline: blocking → learned pruning → matching model, 
   - word TF-IDF on addresses
   - a **multilingual name encoder fine-tuned on the training pairs**, so that native-script names (`ভিশন সিস্টেমস প্রাইভেট লিমিটেড`) meet their Latin counterparts (`Vision Systems Private Limited`)
 - **Learned pruning.** A LightGBM model on cheap similarity features cuts the candidate set to about **5.7 pairs per Source 1 entity**.
-- **Matching model.** A multilingual **cross-encoder reranker** and a second LightGBM using **group features** (how a record compares with the entity's other confident matches) make the final decisions.
+- **Matching model.** A fine-tuned multilingual **cross-encoder reranker** (`BAAI/bge-reranker-v2-m3`, Apache-2.0, 568M parameters) and a second LightGBM using **group features** (how a record compares with the entity's other confident matches) make the final decisions.
 - **Decision rule.** Each record goes to at most one entity, and each entity keeps the set of matches that maximises expected F0.5.
 
 Results:
-- held-out validation macro F0.5: **0.988** (US 0.992, India 0.982)
-- public leaderboard: **0.9806**
+- held-out validation macro F0.5: **0.993** (US 0.993, India 0.993)
+- public leaderboard: [LB_FINAL] (0.9813 with the previous, smaller reranker)
 - nothing hard-codes the country set, so France (unseen in training) is handled by country-agnostic features and an unsupervised region lexicon
 
 ---
@@ -61,7 +61,7 @@ EDA on the 2.2M training Source 1 entities, 5.0M Source 2 and 5.3M Source 3 reco
 
 **Core Innovation:**
 1. A **multilingual name encoder fine-tuned contrastively on the training pairs**, used both for dense blocking and as a feature. It raised validation blocking recall for native-script records from 0.81 to 0.99.
-2. A **cross-encoder reranker** that reads both records jointly.
+2. A **cross-encoder reranker** (bge-reranker-v2-m3) that reads both records jointly and scores every pruned pair. It gave the largest single gain.
 3. **Group features** that exploit the fact that records of one entity resemble each other.
 4. An **assignment-aware decision layer**: each record has one owner, and each entity keeps its expected-F0.5-optimal set of matches.
 
@@ -144,10 +144,11 @@ Every pass runs **within country**, and within the **region** (state / région) 
 2. **Name encoder: `intfloat/multilingual-e5-small`** (MIT, 118M parameters).
    - Fine-tuned with a symmetric in-batch contrastive (InfoNCE) loss on 3M (S1 name, S2/S3 name) true pairs, with native-script pairs oversampled 2×.
    - Used for blocking pass B5 and as a feature.
-3. **Cross-encoder reranker: `multilingual-e5-small`** plus a linear head.
-   - Reads `name | address` of both records together (raw text, native scripts kept).
-   - Trained with binary cross-entropy on ~2.5M pruned pairs of **one half** of the training entities.
-   - It scores the uncertain band (stage-1 p ∈ [0.001, 0.99]) plus each record's encoder top-1 candidate.
+3. **Cross-encoder reranker: `BAAI/bge-reranker-v2-m3`** (Apache-2.0, 568M parameters, XLM-RoBERTa-large), a pretrained multilingual cross-encoder.
+   - Reads `name | address` of both records together (raw text, native scripts kept), max 128 tokens.
+   - Fine-tuned for 1 epoch with binary cross-entropy (lr 2e-5, batch 128, bf16) on the pruned pairs of **one half** of the training entities: every pair in the uncertain band (stage-1 p ∈ [0.001, 0.99], plus each record's encoder top-1 candidate) and a third as many easy pairs.
+   - It then scores **every** pruned pair, with one model copy per GPU.
+   - An earlier version used multilingual-e5-small (118M) on the uncertain band only; validation 0.9877 vs **0.9930** for bge-reranker-v2-m3.
 4. **Stage 2: LightGBM** on:
    - the stage-1 score and rival gaps: best other S1 for the record, rank per record and per entity, expected entity size
    - the reranker logit
@@ -162,7 +163,7 @@ Every model is MIT/Apache-licensed or our own LightGBM, and all are far below 8B
 2. **Per entity:** sort its remaining candidates by probability p₁ ≥ p₂ ≥ …
    - choose the top-j that maximises expected F0.5 ≈ 1.25·Σᵢ≤ⱼ pᵢ / (0.25·(Σᵢ pᵢ + 1) + j)
    - predict **nothing** when P(no match) ≈ Πᵢ(1−pᵢ) is higher, which handles singletons automatically
-3. Chosen on validation against the best global threshold: 0.9881 vs 0.9877.
+3. Chosen on validation against the best global threshold (0.9930 vs 0.9929). Extra = 0.5 is the expected number of true matches the candidates missed.
 
 ---
 
@@ -178,12 +179,14 @@ Every model is MIT/Apache-licensed or our own LightGBM, and all are far below 8B
 | + training on all fit regions (8× data) | 0.985 | 0.992 | 0.975 |
 | + wide reranker band (encoder top-1 pairs) | **0.988** | 0.992 | 0.983 |
 | + learned pruning (5.7 candidates / S1) | 0.988 | 0.992 | 0.982 |
+| + **bge-reranker-v2-m3** (568M) scoring every pruned pair | **0.993** | **0.993** | **0.993** |
 
-  - Precision is 0.998, recall 0.972, and singleton accuracy 0.990.
-  - **Public leaderboard: 0.9806** (unpruned version; the first baseline scored 0.944).
+  - Precision is 0.9992, recall 0.980, and singleton accuracy 0.995.
+  - **Public leaderboard:** 0.944 (baseline) → 0.9806 (unpruned) → 0.9813 (pruned) → [LB_FINAL] (bge reranker).
+  - **Tried and rejected:** search depth scaled with region size. It raised blocking recall (val 0.9949 → 0.9964), but downstream India F0.5 fell (0.982 → 0.969): the extra look-alike negatives made the models lean on name similarity, which hurts scripts unseen in training. Keeping each record's encoder top-1 candidate through pruning (8.2 candidates/S1) was also worse (0.9853).
 - **Common false positives (wrong merges):** there are few (precision 0.998). Most are **distractor records that look like a real entity**: the same generic name (`Jai Trading`, `Apex Engineering`) at a nearby or partial address, or a record whose address matches a different business in the same building.
 - **Common false negatives (missed matches):**
-  1. **Native-script names in scripts rarely seen in training.** Tamil and Malayalam were held out with their regions, for example `Alpha Products Private Limited` ↔ `ஆல்ஃபா புராடக்ட்ஸ் பிரைவேட் லிமிடெட்` at the same address. The final models train on all regions, which covers these scripts.
+  1. **Native-script names in scripts rarely seen in training.** Tamil and Malayalam were held out with their regions, for example `Alpha Products Private Limited` ↔ `ஆல்ஃபா புராடக்ட்ஸ் பிரைவேட் லிமிடெட்` at the same address. The small reranker missed many of these; bge-reranker-v2-m3 recovers most of them (India val 0.982 → 0.993), and the final models train on all regions.
   2. Records whose name was replaced by an unrelated one **and** whose address is heavily truncated.
   3. **Look-alike entities competing for a record:** "taken by another S1", 0.8% of true pairs.
   4. **Blocking misses:** 0.6%. They are concentrated in very large regions (Maharashtra, Delhi), where top-10 neighbour lists are crowded.
@@ -194,7 +197,7 @@ Every model is MIT/Apache-licensed or our own LightGBM, and all are far below 8B
 
 The biggest gains came from three things:
 - treating native-script names as a first-class problem, with a multilingual encoder fine-tuned on the training pairs
-- a cross-encoder that reads both records together
+- a large multilingual cross-encoder that reads both records together
 - exploiting the assignment structure: one owner per record, group consistency and expected-F0.5 set selection
 
 Learned pruning keeps the candidate set small, about 5.7 per entity, close to the 3.5 true matches, at no measurable accuracy cost. A geographic hold-out that mirrors test conditions (including distractors) made every decision measurable.
@@ -210,7 +213,7 @@ Learned pruning keeps the candidate set small, about 5.7 per entity, close to th
 - `README.md` with setup and reproduction instructions
 - `requirements.txt` with pinned versions
 
-**Entry point:** `bash src/reproduce.sh` regenerates `output/matching_results.tsv` and `output/candidate_pairs.tsv` from the raw data. It takes about 4.5 h on one RTX 5090 with 125 GB RAM, and ends with the official validator.
+**Entry point:** `bash src/reproduce.sh` regenerates `output/matching_results.tsv` and `output/candidate_pairs.tsv` from the raw data. It takes about 6 h on a 2x RTX 5090 workstation with 125 GB RAM, and ends with the official validator.
 
 Steps:
 1. `prepare_data.py` → `make_split.py` → `normalize_data.py`
@@ -235,7 +238,7 @@ Library modules (`src/ber/`):
 | `evaluate` | exact macro F0.5 with the singleton rule, blocking recall / oracle report |
 
 **Licences:**
-- pretrained model: multilingual-e5-small (MIT)
+- pretrained models: multilingual-e5-small (MIT, 118M) and bge-reranker-v2-m3 (Apache-2.0, 568M)
 - libraries: polars, numpy, scipy, scikit-learn, LightGBM, rapidfuzz, torch, transformers (all MIT / BSD / Apache-2.0), plus anyascii (ISC)
 
 **Data use:** only the provided data.

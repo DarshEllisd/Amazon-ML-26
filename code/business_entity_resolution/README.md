@@ -5,9 +5,10 @@ records. It writes `output/matching_results.tsv` (the leaderboard file) and
 `output/candidate_pairs.tsv` (the exact pairs the matching model scores). The methodology is in
 `Documentation_template.md` at the package root.
 
-**Results:** held-out validation macro F0.5 is **0.988** (US 0.992, India 0.982; 285k S1 entities in
-held-out regions). The public leaderboard gave **0.9806** for the unpruned version. The candidate set
-is ~5.7 pairs per S1 entity after learned pruning, where the average entity has 3.5 true matches.
+**Results:** held-out validation macro F0.5 is **0.993** (US 0.993, India 0.993; 285k S1 entities in
+held-out regions). The public leaderboard gave 0.9813 for the previous, smaller-reranker version. The
+candidate set is ~5.7 pairs per S1 entity on validation (7.4 on test) after learned pruning, where the
+average entity has 3.5 true matches.
 
 ## Setup
 
@@ -22,7 +23,8 @@ pip install -r requirements.txt
 - a CUDA GPU: about 12 GB of GPU memory is used, for top-k search, encoder training and reranking
 - 64 GB RAM recommended; the observed peak is about 30 GB, because blocking runs one country per process
 
-The only download is the pretrained `intfloat/multilingual-e5-small` weights (MIT licence). They come
+The only downloads are the pretrained weights of `intfloat/multilingual-e5-small` (MIT licence, the
+name encoder) and `BAAI/bge-reranker-v2-m3` (Apache-2.0, 568M parameters, the cross-encoder). They come
 from the Hugging Face hub on first use and are cached under `HF_HOME`. No other external data or
 service is used.
 
@@ -37,7 +39,7 @@ Run this from this directory. It regenerates both output files from the raw data
 official validator:
 
 ```bash
-bash src/reproduce.sh              # ~4.5 h on the machine above
+bash src/reproduce.sh              # ~6 h on the machine above
 bash src/reproduce.sh --validate   # also the held-out validation experiment (+~2.5 h)
 ```
 
@@ -64,9 +66,9 @@ universe, and `block → features → predict` on `val`/`test`. Any single stage
 Large universes are blocked one country per subprocess to bound memory.
 
 The final settings are the code defaults:
-- reranker band `wide` (`BER_BAND`)
+- cross-encoder `bge-reranker-v2-m3` scoring every pruned pair (`BER_RERANK_MODEL`, `BER_RERANK_ALL`)
 - learned pruning at stage-1 p ≥ 1e-4 (`BER_PRUNE_P1`)
-- expected-F0.5 decision rule, extra = 1.0 (`FINAL_RULE` in `run_pipeline.py`, selected on validation)
+- expected-F0.5 decision rule, extra = 0.5 (`FINAL_RULE` in `run_pipeline.py`, selected on validation)
 
 `BER_JOBS` caps the CPU workers. LightGBM uses at most 32 threads, because more was much slower on
 64 cores.
@@ -93,7 +95,7 @@ Tests: `python -m pytest -q tests`
    - ~45 pairwise features: rapidfuzz name/address similarities, number overlap, legal-form agreement, TF-IDF and encoder cosines
    - competition features: gap and rank against the other candidates of the same record
 5. **Learned pruning:** pairs with stage-1 p < 1e-4 are dropped. The remaining pairs are `candidate_pairs.tsv`, and nothing after this point sees any other pair.
-6. **Cross-encoder reranker** (`ber/rerank.py`): multilingual-e5-small reads `name | address` of both records. It scores the uncertain band plus the encoder's top-1 candidate of each record. It is trained on one half of the entities; stage 2 learns how far to trust it on the other half.
+6. **Cross-encoder reranker** (`ber/rerank.py`): `BAAI/bge-reranker-v2-m3` (Apache-2.0, 568M), a pretrained multilingual cross-encoder, reads `name | address` of both records. It is fine-tuned on the uncertain band plus some easy pairs of one half of the entities, then scores every pruned pair. Stage 2 learns how far to trust it on the other half. Scoring runs one model copy per GPU.
 7. **Stage 2** (`ber/group.py` + LightGBM):
    - out-of-fold stage-1 scores and rival-S1 gaps
    - the reranker logit

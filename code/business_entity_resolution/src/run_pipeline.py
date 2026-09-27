@@ -229,7 +229,7 @@ PRUNE_P1 = float(os.environ.get("BER_PRUNE_P1", 1e-4))
 
 
 # decision rule selected on validation (expected-F0.5 set selection beat every global threshold)
-FINAL_RULE = {"rule": "ef", "extra": 1.0, "tau": 0.55}
+FINAL_RULE = {"rule": "ef", "extra": 0.5, "tau": 0.65}
 PRUNE_KEEP_ECOS1 = os.environ.get("BER_PRUNE_KEEP_ECOS1", "0") == "1"   # val: worse (0.9853 vs 0.9877)
 
 
@@ -345,15 +345,25 @@ def stage_rerank(run):
     split = "train"
     d = rdir(run)
     oof = _prune(pl.read_parquet(d / "scored_oof.parquet"))
-    band = oof.filter(rerank.in_band(pl, oof.columns))
+    # training pairs: the uncertain band (the hard cases), even when every pair is scored later
+    band = oof.filter(rerank.in_band(pl, oof.columns, band_only=True))
     gt = load_gt_pairs().with_columns(pl.lit(1.0).alias("y"))
     band = band.join(gt, on=["s1_id", "m_src", "m_id"], how="left").with_columns(pl.col("y").fill_null(0.0))
     tr = band.filter(rerank.half_expr(pl) == rerank.RERANK_HALF)
     if tr.height > RERANK_MAX:
         tr = tr.sample(RERANK_MAX, seed=config.SEED)
+    if rerank.RERANK_ALL:   # plus some easy pairs, since every pair gets scored
+        easy = (oof.filter(rerank.half_expr(pl) == rerank.RERANK_HALF)
+                .join(tr.select("s1_id", "m_src", "m_id"), on=["s1_id", "m_src", "m_id"], how="anti")
+                .join(gt, on=["s1_id", "m_src", "m_id"], how="left").with_columns(pl.col("y").fill_null(0.0)))
+        n_easy = min(easy.height, max(0, RERANK_MAX - tr.height), tr.height // 3)
+        tr = pl.concat([tr, easy.sample(n_easy, seed=config.SEED).select(tr.columns)])
     log(f"rerank: band {band.height:,} pairs; training on {tr.height:,} ({tr['y'].mean():.1%} positive)")
-    a, b = _pair_texts(split, tr)
-    rerank.train(a, b, tr["y"].to_list(), log=log)
+    if os.environ.get("BER_RERANK_REUSE") and (rerank.model_dir() / "head.pt").exists():
+        log(f"  reusing trained reranker in {rerank.model_dir()}")
+    else:
+        a, b = _pair_texts(split, tr)
+        rerank.train(a, b, tr["y"].to_list(), log=log)
     other = oof.filter(rerank.half_expr(pl) != rerank.RERANK_HALF)
     xe = _rerank_frame(split, other)
     xe.write_parquet(d / "rerank_oof.parquet")
