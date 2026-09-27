@@ -42,7 +42,9 @@ def norm_path(split, src):
 
 
 def run_dir(run):
-    return WORK_DIR / "runs" / run
+    # BER_RUN_SUFFIX keeps experiment runs apart (e.g. fitall_k2)
+    suffix = os.environ.get("BER_RUN_SUFFIX", "")
+    return WORK_DIR / "runs" / (f"{run}_{suffix}" if suffix else run)
 
 
 # worker threads/processes; defaults to every core (override with BER_JOBS)

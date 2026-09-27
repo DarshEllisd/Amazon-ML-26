@@ -40,6 +40,18 @@ TFIDF_ADDR = dict(analyzer="word", token_pattern=r"\S+", sublinear_tf=True, min_
 K_ADDR = 5
 K_EMB = 10
 MIN_ECOS = 0.3
+# Search deeper in large regions: top-k lists fill with look-alikes when a region has
+# 100k+ entities (Maharashtra, Delhi). k grows with sqrt(region size / REGION_K_REF),
+# capped at K_SCALE_MAX x the base k. Learned pruning later removes the extra junk.
+K_SCALE = os.environ.get("BER_K_SCALE", "0") == "1"   # experiment: BER_K_SCALE=1
+REGION_K_REF = 30_000
+K_SCALE_MAX = 3
+
+
+def scaled_k(k, n_index):
+    if not K_SCALE:
+        return k
+    return int(min(k * K_SCALE_MAX, max(k, round(k * (n_index / REGION_K_REF) ** 0.5))))
 VEC_FIT_MAX = 3_000_000
 
 
@@ -131,8 +143,10 @@ def _region_pass(search, n_x, s1_reg, m_reg, k_region, k_pool, log=None):
     def add(qi, xi, k, what):
         if len(qi) == 0 or len(xi) == 0:
             return
+        if what != "pool":
+            k = scaled_k(k, len(xi))
         if log is not None:
-            log(f"    {what}: {len(qi):,} queries x {len(xi):,} S1")
+            log(f"    {what}: {len(qi):,} queries x {len(xi):,} S1 (k={k})")
         r, c, v = search(qi, xi, k)
         df = pl.DataFrame({"q": qi[r].astype(np.int64), "x": xi[c].astype(np.int64), "cos": v})
         out.append(df.with_columns(  # rank within this search, 0 = best

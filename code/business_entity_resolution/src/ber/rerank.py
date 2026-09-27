@@ -6,10 +6,12 @@ match logit. It sees token-level interactions the pairwise similarity features
 cannot (a transliterated street name, a reordered brand), so it is used only on
 the band of pairs stage 1 is unsure about.
 
-Base: intfloat/multilingual-e5-small (MIT) with a linear head on the mean-pooled
-output. Trained on fit-universe band pairs of *one half* of the fit entities
-(RERANK_HALF); stage 2 learns how far to trust it on the other half, so its
-scores are never in-sample for stage 2.
+Models (BER_RERANK_MODEL):
+  e5-small  intfloat/multilingual-e5-small (MIT, 118M) + linear head on the mean-pooled output
+  bge-m3    BAAI/bge-reranker-v2-m3 (Apache-2.0, 568M), a pretrained multilingual cross-encoder
+Trained on pairs of *one half* of the fit entities (RERANK_HALF); stage 2 learns how
+far to trust it on the other half, so its scores are never in-sample for stage 2.
+BER_RERANK_ALL=1 scores every pruned candidate pair instead of the uncertain band.
 """
 import os
 import time
@@ -26,16 +28,25 @@ MAX_LEN = 128
 # name encoder's top-1 candidate of each record; narrow: p in [0.01, 0.99]
 BAND = (0.001, 0.99) if os.environ.get("BER_BAND", "wide") == "wide" else (0.01, 0.99)
 RERANK_HALF = 0           # fit entities with hash(s1_id) % 2 == RERANK_HALF train the reranker
+KIND = os.environ.get("BER_RERANK_MODEL", "e5-small")
+MODELS = {  # name -> (checkpoint, train batch, learning rate)
+    "e5-small": (BASE_MODEL, 256, 5e-5),
+    "bge-m3": ("BAAI/bge-reranker-v2-m3", 128, 2e-5),
+}
+RERANK_ALL = os.environ.get("BER_RERANK_ALL", "0") == "1"
 
 
 def model_dir():
-    return config.WORK_DIR / "models" / f"reranker{config.tag_suffix()}"
+    kind = "" if KIND == "e5-small" else f"_{KIND}"
+    return config.WORK_DIR / "models" / f"reranker{config.tag_suffix()}{kind}"
 
 
 def in_band(pl, columns):
     """Pairs worth a cross-encoder look: uncertain stage-1 p, or the name encoder's
     top candidate for the record even when stage 1 is sure it is not a match
     (cross-script names the pairwise features cannot see)."""
+    if RERANK_ALL:
+        return pl.lit(True)
     cond = pl.col("p").is_between(*BAND)
     if "ecos_rank_m" in columns and os.environ.get("BER_BAND", "wide") == "wide":
         cond = cond | ((pl.col("ecos_rank_m") == 1) & (pl.col("p") < BAND[1]))
@@ -47,26 +58,37 @@ def half_expr(pl):
 
 
 class CrossEncoder(torch.nn.Module):
-    def __init__(self, path_or_name):
+    """e5-small: mean-pooled encoder + linear head. bge-m3: its own classification head."""
+
+    def __init__(self, path_or_name, kind=KIND):
         super().__init__()
-        from transformers import AutoModel
-        self.enc = AutoModel.from_pretrained(path_or_name)
-        self.head = torch.nn.Linear(self.enc.config.hidden_size, 1)
+        self.kind = kind
+        if kind == "e5-small":
+            from transformers import AutoModel
+            self.enc = AutoModel.from_pretrained(path_or_name)
+            self.head = torch.nn.Linear(self.enc.config.hidden_size, 1)
+        else:
+            from transformers import AutoModelForSequenceClassification
+            self.enc = AutoModelForSequenceClassification.from_pretrained(path_or_name, num_labels=1)
 
     def forward(self, batch):
+        if self.kind != "e5-small":
+            return self.enc(**batch).logits[:, 0]
         h = self.enc(**batch).last_hidden_state
         mask = batch["attention_mask"].unsqueeze(-1).to(h.dtype)
         return self.head((h * mask).sum(1) / mask.sum(1).clamp(min=1)).squeeze(-1)
 
 
-def _tok():
+def _tok(path=None):
     from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(BASE_MODEL)
+    return AutoTokenizer.from_pretrained(path or MODELS[KIND][0])
 
 
-def train(a, b, y, epochs=1, batch_size=256, lr=5e-5, device="cuda", log=print):
+def train(a, b, y, epochs=1, batch_size=None, lr=None, device="cuda", log=print):
+    ckpt, bs, base_lr = MODELS[KIND]
+    batch_size, lr = batch_size or bs, lr or base_lr
     tok = _tok()
-    model = CrossEncoder(BASE_MODEL).to(device).train()
+    model = CrossEncoder(ckpt).to(device).train()
     n = len(a)
     steps = epochs * (n // batch_size)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
@@ -95,19 +117,26 @@ def train(a, b, y, epochs=1, batch_size=256, lr=5e-5, device="cuda", log=print):
                 log(f"  rerank step {step}/{steps} loss {loss.item():.4f} ({time.time() - t0:.0f}s)")
     out = model_dir()
     out.mkdir(parents=True, exist_ok=True)
-    torch.save({"head": model.head.state_dict()}, out / "head.pt")
     model.enc.save_pretrained(out)
     tok.save_pretrained(out)
+    # head.pt marks a finished model (and holds the e5 head)
+    torch.save({"head": model.head.state_dict() if KIND == "e5-small" else None, "kind": KIND},
+               out / "head.pt")
     return out
 
 
 @torch.no_grad()
 def score(a, b, batch_size=1024, device="cuda", log=print):
     """Match logits for aligned text lists a, b."""
-    tok = _tok()
-    model = CrossEncoder(str(model_dir()))
-    model.head.load_state_dict(torch.load(model_dir() / "head.pt", map_location="cpu")["head"])
+    tok = _tok(str(model_dir()))
+    saved = torch.load(model_dir() / "head.pt", map_location="cpu")
+    model = CrossEncoder(str(model_dir()), kind=saved.get("kind", "e5-small"))
+    if model.kind == "e5-small":
+        model.head.load_state_dict(saved["head"])
     model = model.to(device).eval().half()
+    if torch.cuda.device_count() > 1:          # split each batch across the GPUs
+        model = torch.nn.DataParallel(model)
+        batch_size *= torch.cuda.device_count()
     order = np.argsort([len(x) + len(z) for x, z in zip(a, b)], kind="stable")
     out = np.empty(len(a), dtype=np.float32)
     t0 = time.time()
@@ -115,7 +144,7 @@ def score(a, b, batch_size=1024, device="cuda", log=print):
         idx = order[i:i + batch_size]
         batch = tok([a[j] for j in idx], [b[j] for j in idx], padding=True, truncation=True,
                     max_length=MAX_LEN, return_tensors="pt").to(device)
-        out[idx] = model(batch).float().cpu().numpy()
+        out[idx] = model(dict(batch)).float().cpu().numpy()
         if k % 200 == 0:
             log(f"  reranked {min(i + batch_size, len(a)):,}/{len(a):,} ({time.time() - t0:.0f}s)")
     return out

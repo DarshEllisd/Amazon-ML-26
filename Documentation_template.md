@@ -96,7 +96,7 @@ Every pass runs **within country**, and within the **region** (state / région) 
   - Pairs with p < 1e-4 are dropped.
   - `candidate_pairs.tsv` is exactly the set that survives, and it is the only set the matching model (reranker and stage 2) ever runs on.
 
-**Candidate pairs generated (test):** [TEST_CANDIDATES] pairs, **[TEST_CPS] per S1 entity**. Before pruning, blocking produced ~46 per entity.
+**Candidate pairs generated (test):** 12,809,075 pairs, **7.4 per S1 entity**. Before pruning, blocking produced ~46 per entity.
 
 **How we ensured true matches were not lost (validation, held-out regions):**
 
@@ -252,7 +252,7 @@ Library modules (`src/ber/`):
 | Share | 0.50 | 0.86 | 0.84 | 0.96 | 0.995 |
 
 - **Test predictions:**
-  - matches per S1: India [TEST_IN], US [TEST_US], France [TEST_FR]
-  - share of empty lists: India [TEST_IN_E], US [TEST_US_E], France [TEST_FR_E]
+  - matches per S1: India 3.35, US 3.38, France 3.38
+  - share of empty lists: India 6.0%, US 5.8%, France 5.4%
   - The US/India training mean is 3.5 matches and 5.6% singletons, and France predictions are consistent with that.
 - **Compute:** a single workstation (64 cores, 125 GB RAM, 1× RTX 5090 used at a time). Blocking and scoring run one country per process, so peak RAM stays around 30 GB.
