@@ -44,7 +44,13 @@ BER_RERANK_MODEL=e5-small $PY src/run_pipeline.py --run all --stage group  --mod
 #    (France uses final_e5, set by DEFAULT_COUNTRY_MODELS / BER_COUNTRY_MODELS)
 $PY src/run_pipeline.py --run test --stage all --model final
 
-# 6. official validator
+# 6. official validator (part of the challenge's student_resource kit, not of this package;
+#    set BER_VALIDATOR=/path/to/validate_submission.py if it lives elsewhere)
 R=../../6ab10eb3b23ba_student_resource/student_resource
-python "$R/utils/validate_submission.py" --matching "${BER_OUTPUT_DIR:-../../output}/matching_results.tsv" \
-  --candidate "${BER_OUTPUT_DIR:-../../output}/candidate_pairs.tsv" --test-dir "${BER_DATA_DIR:-$R/dataset}/test" --check-ids
+VALIDATOR="${BER_VALIDATOR:-$R/utils/validate_submission.py}"
+if [ -f "$VALIDATOR" ]; then
+  python "$VALIDATOR" --matching "${BER_OUTPUT_DIR:-../../output}/matching_results.tsv" \
+    --candidate "${BER_OUTPUT_DIR:-../../output}/candidate_pairs.tsv" --test-dir "${BER_DATA_DIR:-$R/dataset}/test" --check-ids
+else
+  echo "validator not found at $VALIDATOR: skipping the format check (outputs are written)"
+fi

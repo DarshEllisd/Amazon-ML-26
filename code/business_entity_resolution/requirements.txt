@@ -1,4 +1,5 @@
-# Python 3.9 (tested on 3.9.0, Windows 11). All dependencies are MIT/BSD/Apache-2.0/ISC licensed.
+# Python 3.9. Final run: Ubuntu 24.04, Python 3.9, 2x RTX 5090 (development also on Windows 11).
+# All dependencies are MIT/BSD/Apache-2.0/ISC licensed.
 polars==1.8.2
 pyarrow==21.0.0
 numpy==1.24.4
@@ -8,12 +9,14 @@ rapidfuzz==3.13.0
 lightgbm==4.6.0
 anyascii==0.3.3          # ISC: ASCII fold / transliteration of native scripts
 pytest==8.4.2
-# multilingual name encoder (ber.embed): transformers Apache-2.0; base model intfloat/multilingual-e5-small (MIT)
+# transformers (Apache-2.0) for the pretrained models, downloaded from the Hugging Face hub on first use:
+#   intfloat/multilingual-e5-small (MIT, 118M): name encoder + France reranker
+#   BAAI/bge-reranker-v2-m3 (Apache-2.0, 568M): US/India reranker
 transformers==4.46.3
 tokenizers==0.20.3
 safetensors==0.4.5
 huggingface-hub==0.26.5
-# GPU top-k search (optional; falls back to scipy on CPU, much slower on test).
-# Install the CUDA build: laptop (RTX 4050) torch==2.5.1 +cu121; workstation (RTX 5090 needs CUDA 12.8)
+# torch: GPU top-k search, encoder and rerankers (a CUDA GPU is needed for the full run).
+# Install the CUDA build (RTX 50xx needs CUDA 12.8):
 #   pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
 torch==2.7.1

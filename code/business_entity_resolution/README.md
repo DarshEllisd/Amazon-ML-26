@@ -36,7 +36,9 @@ service is used.
 ## Reproduce the submission
 
 Run this from this directory. It regenerates both output files from the raw data and then runs the
-official validator:
+official validator. The validator comes from the challenge's `student_resource` kit and isn't part of this
+package. Point `BER_VALIDATOR` at `validate_submission.py`, or the check is skipped; the output files are
+written either way.
 
 ```bash
 bash src/reproduce.sh              # ~6 h on the machine above
