@@ -8,7 +8,6 @@ scikit-learn==1.6.1
 rapidfuzz==3.13.0
 lightgbm==4.6.0
 anyascii==0.3.3          # ISC: ASCII fold / transliteration of native scripts
-pytest==8.4.2
 # transformers (Apache-2.0) for the pretrained models, downloaded from the Hugging Face hub on first use:
 #   intfloat/multilingual-e5-small (MIT, 118M): name encoder + France reranker
 #   BAAI/bge-reranker-v2-m3 (Apache-2.0, 568M): US/India reranker

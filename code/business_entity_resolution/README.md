@@ -84,8 +84,6 @@ The final settings are the code defaults:
 `BER_JOBS` caps the CPU workers. LightGBM uses at most 32 threads, because more was much slower on
 64 cores.
 
-Tests: `python -m pytest -q tests`
-
 ## Pipeline
 
 1. **Normalisation** (`ber/normalize.py`):
@@ -120,7 +118,6 @@ Tests: `python -m pytest -q tests`
 - `src/ber/`: library modules
   - `config`, `io`, `evaluate` (exact macro F0.5), `geo`, `normalize`, `topk`, `blocking`, `embed`, `features`, `rerank`, `group`, `assign`
 - `src/prepare_data.py`, `src/make_split.py`, `src/normalize_data.py`, `src/train_encoder.py`, `src/run_pipeline.py`, `src/reproduce.sh`: entry points
-- `tests/`: unit tests for the evaluator, normalisers, top-k search and decision rules
 
 ## Validation protocol
 
